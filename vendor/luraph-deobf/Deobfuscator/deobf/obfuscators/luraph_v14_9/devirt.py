@@ -41,6 +41,7 @@ from ir import (IRStmt, Assign, CallStmt, SetList, GenIter, Outcome, Next, Ret, 
                 ForPrep, Close, Opaque, Vec, Missing, fmt_expr, fmt_any, fmt_tail, fmt_multi, fmt_const,
                 fmt_stmt, fmt_node)
 
+
 class NilIndex(Missing):
     """Symbolic read through a table base that the v14 tracer could not
     materialize.  Unlike an undecoded constant, this is safe to fork on: the
@@ -632,9 +633,7 @@ class VMModel:
 
     def maker_args(self, vmobj, proto, upvals):
         n = len(self.maker["args"])
-        # 参数表可能比 maker 形参个数长：upvals_index 有时正是 proto_index + 1，
-        # 只按 len(args) 分配会 IndexError（上游 issue #3 的修法）。
-        vals = [None] * max(n, 3, self.proto_index() + 1, self.upvals_index() + 1)
+        vals = [None] * max(n, 3)
         vals[0], vals[self.proto_index()], vals[self.upvals_index()] = vmobj, proto, upvals
         return vals
 
@@ -760,61 +759,6 @@ class State:
 
 # --------------------------------------------------------------------------
 
-# --------------------------------------------------------------------------
-# 栈指针的符号值：上游在这里直接放弃整条路径，结果 14.7 少了三整段代码
-#
-# 现场（14.7 样本，三个调用点 0:163 / 0:1540 / 0:1584）：
-#   op 183 是 CALL，它的收尾会算 `V = N + i - 1`（V＝多返回值顶部/栈指针），
-#   而 N 来自 `d[50](被调函数(...))` —— 一个 VM 内置助手（返回「结果个数 + 结果表」）。
-#   提升器把这次调用物化成一个临时变量（TempVal），于是 N 是符号值，
-#   V 也就跟着变成符号表达式 `(t163_220_4 + 88) - 1`。
-#   `_carried` 只接受整数，于是抛 Unsupported，整条调用链就断了。
-#
-# 但 V 的用途只有两类：
-#   1) 遍历记账：栈顶剪枝（哪些跳转寄存器还活着）、状态去重、栈深度上限；
-#   2) 后面指令读它时，作为**表达式**出现在生成代码里。
-#   (2) 恰恰需要保留符号表达式（那个临时变量在同一函数里已经生成了，表达式本身是合法代码）。
-#   所以：把符号值原样带着，另配一个数字替身给 (1) 用；所有替身互相相等，
-#   状态空间才不会因为每轮临时变量名字不同而爆炸。
-# --------------------------------------------------------------------------
-
-class CarriedSym(Expr):
-    """carried local（栈指针 / 多返回值顶部）拿到符号值时的包装。"""
-
-    pure = False
-
-    def __init__(self, expr, num=0):
-        self.expr = expr
-        self.num = int(num) if isinstance(num, (int, float)) and not isinstance(num, bool) else 0
-
-    def __repr__(self):
-        return "~%d%r" % (self.num, self.expr)
-
-    # 遍历时当数字用（max / min / 比较栈深度）
-    @staticmethod
-    def _n(other):
-        return other.num if isinstance(other, CarriedSym) else other
-
-    def __lt__(self, o):
-        return self.num < self._n(o)
-    def __le__(self, o):
-        return self.num <= self._n(o)
-    def __gt__(self, o):
-        return self.num > self._n(o)
-    def __ge__(self, o):
-        return self.num >= self._n(o)
-
-    # 所有近似值视为同一个状态，避免走飞
-    def __eq__(self, o):
-        return isinstance(o, CarriedSym)
-    def __hash__(self):
-        return hash(CarriedSym)
-
-
-#: 栈指针符号值兜底的上限（见 CarriedSym）：放开以后搜索空间会明显变大，
-#: 但 14.7 这类样本正是靠它才能把整份脚本走完。超上限就退回上游行为。
-SYM_CARRY_MAX = int(os.environ.get("DEVIRT_V14_SYM_CARRY_MAX", "200"))
-
 WALK_MAX_ERRORS = int(os.environ.get("DEVIRT_WALK_MAX_ERRORS", "500"))
 WALK_RESTARTS = int(os.environ.get("DEVIRT_WALK_RESTARTS", "256"))
 MAX_STACK_DEPTHS = int(os.environ.get("DEVIRT_MAX_STACK_DEPTHS", "32"))
@@ -873,8 +817,6 @@ class ProtoLifter:
         self.pack_copies = {}
         self.pack_read = set()
         self.pack_unstable = set()   # (reg, text) packs left out of walk states (see Program._walk)
-        self.approx_carried = 0      # 栈指针用符号值兜底的次数（CarriedSym）
-        self.approx_sites = set()    # 出现过近似的 carried 变量
         self.pack_killed = set()     # (reg, text) unread packs overwritten somewhere
         self.ov = None          # overlay of the current run (child of the state's)
         self.ov_base = None
@@ -1467,13 +1409,6 @@ class ProtoLifter:
                     return Missing(None)
                 if os.environ.get("DEVIRT_TB"):
                     print("   table tid=%s path=%s items=%s" % (obj.tid, self.dump.paths().get(obj.tid), str(list(obj.h.items())[:12])), file=sys.stderr)
-                if os.environ.get("DEVIRT_DBG_MISS"):
-                    import sys as _sys
-                    print("### sym index: walk_only=%s obj=%s tid=%s key=%s nodes=%s late=%d misses=%s"
-                          % (self.walk_only, type(obj).__name__, getattr(obj, "tid", None),
-                             fmt_expr(key),
-                             [type(x).__name__ for x in walk_expr(key)][:8] if isinstance(key, Expr) else "-",
-                             len(self.dump.late), list(self.dump.misses)[:4]), file=_sys.stderr)
                 raise Unsupported("symbolic index into a concrete VM table (key %s)" % fmt_expr(key))
             v = obj.get(key)
             if self.ov_base is not None and obj.tid is not None:
@@ -1564,15 +1499,6 @@ class ProtoLifter:
             if is_sym(key):
                 arr = self.reg_array(key)
                 if arr is None:
-                    if os.environ.get("DEVIRT_V14_LOOP_ONCE"):
-                        # Best effort: the register index of this store is an
-                        # expression the walk cannot turn into an array base
-                        # yet.  Dropping the store keeps the rest of the
-                        # function liftable; the output header marks the file
-                        # as a partial reconstruction.
-                        print("[*]   best effort: skipped a symbolic register store",
-                              file=sys.stderr)
-                        return
                     raise Unsupported("symbolic register store")
                 self.emit(Assign(Index(*arr), self.value_of(v)))
                 return
@@ -1664,9 +1590,6 @@ class ProtoLifter:
         # (forking both ways here in request walks was tried: same functions
         # per round on StealAnEgg, but walks into junk code; not worth it)
         if any(isinstance(x, Missing) and not isinstance(x, NilIndex) for x in walk_expr(cond)):
-            if os.environ.get("DEVIRT_DBG_MISS"):
-                print("### decision: cond=%s nodes=%s" % (fmt_expr(cond),
-                      [type(x).__name__ for x in walk_expr(cond)][:10]), file=sys.stderr)
             raise Unsupported("needs a constant that is not decoded yet")
 
     def value_of(self, v):
@@ -1853,17 +1776,7 @@ class ProtoLifter:
                                Multi([self.value_of(x) if x is not None else Const(None) for x in a.items])))
             return dst
         if is_sym(e):
-            # 末尾索引是符号值（多返回值顶部那份符号账）：别放弃整块，
-            # 直接把 table.move 原样生成出来 —— 读代码时正好能看出这里是搬寄存器。
-            # 只有参数确实渲染不出来才继续报错。
-            try:
-                margs = Multi([self.value_of(x) if x is not None else Const(None)
-                               for x in a.items])
-            except Unsupported:
-                raise Unsupported("table.move with symbolic end")
-            tt = self.new_temp()
-            self.emit(CallStmt(tt, Global("table.move"), margs))
-            return dst
+            raise Unsupported("table.move with symbolic end")
         n = e - f + 1
         for k in range(n):
             v = self.elem(src, f + k)
@@ -2481,47 +2394,21 @@ class Stepper:
         mode = inner.lookup(self.mode_decl).vars[self.mode_decl] if self.mode_decl else 0
         ks = inner.lookup(self.vm.kstack_key) if self.vm.kstack_key else None
         locs = self._carried(inner)
-        nums = [v for _, v in locs if isinstance(v, int) and not isinstance(v, bool)]
-        if nums:
+        if locs:
             # a carried local indexes the registers: a stack pointer, whose
             # initial value is the frame size (the slots above: operand stack)
-            self.lf.stack_base = min(nums)
+            self.lf.stack_base = min(v for _, v in locs)
         return State(mode, pc, ks.vars[self.vm.kstack_key] if ks else None, locs=locs)
 
-    def _carried(self, inner, state=None):
-        """State.locs: the carried locals' current values.
-
-        整数直接用；符号值（栈指针/多返回值顶部经过 VM 助手调用后）包成
-        CarriedSym 继续走 —— 上游在这里直接抛 Unsupported，会丢掉整段代码。
-        """
+    def _carried(self, inner):
+        """State.locs: the carried locals' current values."""
         out = []
         for k in sorted(self.carry):
             v = inner.vars.get(k)
             if not (isinstance(v, int) and not isinstance(v, bool)):
-                v = self._approx_carried(k, v, state)
+                raise Unsupported("symbolic value of a VM local carried between instructions (%r)" % (v,))
             out.append((k, v))
         return tuple(out)
-
-    def _approx_carried(self, k, v, state):
-        """符号值的兜底：数字替身优先用上一轮同名的值，其次用帧大小。"""
-        if self.lf.approx_carried >= SYM_CARRY_MAX:
-            raise Unsupported("symbolic value of a VM local carried between instructions (%r)" % (v,))
-        prev = None
-        for d, pv in (state.locs if state is not None and state.locs else ()):
-            if d == k:
-                prev = getattr(pv, "num", pv)
-                break
-        if isinstance(prev, int) and not isinstance(prev, bool):
-            num = prev
-        elif self.lf.stack_base is not None:
-            num = self.lf.stack_base
-        else:
-            num = 0
-        self.lf.approx_carried += 1
-        self.lf.approx_sites.add((k,))
-        if os.environ.get("DEVIRT_V14_VERBOSE_SYM_CARRY"):
-            print("-- 栈指针近似：%s = %s (按 %d 处理)" % (k, v, num), file=sys.stderr)
-        return CarriedSym(v, num)
 
     def _fresh_scopes(self, state, it):
         """Scopes at the top of the loop function, before the first loop;
@@ -2541,8 +2428,7 @@ class Stepper:
             if self.vm.kstack_key:
                 inner.lookup(self.vm.kstack_key).vars[self.vm.kstack_key] = state.kstack
             for k, v in state.locs:
-                # 读回去时用原始符号表达式：后面指令产生的代码才是对的
-                inner.vars[k] = getattr(v, "expr", v)
+                inner.vars[k] = v
         return cs, inner
 
     def run_once(self, state, decisions, tprefix):
@@ -2606,7 +2492,7 @@ class Stepper:
         if outcome[0] == "next":
             def get(k):
                 return inner.lookup(k).vars[k]
-            locs = self._carried(inner, state)
+            locs = self._carried(inner)
             sb = lf.stack_base
             if sb is not None and locs:
                 # operand stack slots: a value stays known while it is on the
@@ -3415,21 +3301,6 @@ class Program:
             return s0, order, True
         return s0, order, False
 
-def _pick_loop(st, mode):
-    """挑出处理该 mode 的调度循环；v14.7 外层是 repeat...until false，
-    没有 mode 比较式，这时 loop 条件认不出来，直接用它唯一那个循环。"""
-    for i, ifn, w in st.loops:
-        c = st.conds.get(i)
-        if c is None:
-            continue
-        k = c["right"] if c["right"]["type"] == "AstExprConstantNumber" else c["left"]
-        if S.fix_int(k["value"]) == mode:
-            return i, ifn, w
-    if len(st.loops) == 1:
-        return st.loops[0]
-    return None
-
-
 def show_op(prog, key, mode, pc, force_op=None):
     cap = prog.dump.protos[key]
     vm = prog.vm_of(cap)
@@ -3437,38 +3308,33 @@ def show_op(prog, key, mode, pc, force_op=None):
                      LTable(), prog.globals)
     st = make_stepper(vm, lf)
     lines = prog.lines
-    picked = _pick_loop(st, mode)
-    if picked is None:
-        print("no loop for mode", mode)
+    for i, ifn, w in st.loops:
+        c = st.conds[i]
+        k = c["right"] if c["right"]["type"] == "AstExprConstantNumber" else c["left"]
+        if S.fix_int(k["value"]) != mode:
+            continue
+        d = [x for x in vmmap.find_dispatchers(prog.root) if x["node"] is w][0]
+        arrs = {}
+        for nm, keys in vm.maker_decls.items():
+            if len(keys) == 1 and keys[0] in lf.maker_scope.vars:
+                v = lf.maker_scope.vars[keys[0]]
+                if isinstance(v, LTable) and id(v) in lf.proto_arrays:
+                    arrs[nm] = v
+        # the loop's opcode array is named in the dispatch statement; resolve via VM scope aliases
+        opname = d["arr"]
+        cs = st.cs
+        it = S.Interp(lf)
+        _, inner = st._fresh_scopes(None, it)
+        stmt = w["body"]["body"][0]
+        opv = it.eval(stmt["values"][0]["expr"], inner)
+        op = opv.get(pc) if force_op is None else force_op
+        print("mode %d pc %d: op %s (array %s)" % (mode, pc, op, opname))
+        for nm, v in sorted(arrs.items()):
+            print("   %s[%d] = %s" % (nm, pc, fmt_any(v.get(pc))))
+        blk = vmmap.resolve(d["tree"], d["op"], op)
+        print(vmmap.text_of(lines, blk) if blk else "<no handler>")
         return
-    i, ifn, w = picked
-    d = [x for x in vmmap.find_dispatchers(prog.root) if x["node"] is w]
-    if not d:
-        print("no dispatcher for that loop")
-        return
-    d = d[0]
-    arrs = {}
-    for nm, keys in vm.maker_decls.items():
-        if len(keys) == 1 and keys[0] in lf.maker_scope.vars:
-            v = lf.maker_scope.vars[keys[0]]
-            if isinstance(v, LTable) and id(v) in lf.proto_arrays:
-                arrs[nm] = v
-    opname = d["arr"]
-    it = S.Interp(lf)
-    _, inner = st._fresh_scopes(None, it)
-    stmt = w["body"]["body"][0]
-    opv = it.eval(stmt["values"][0]["expr"], inner)
-    if force_op is not None:
-        op = force_op
-    elif hasattr(opv, "get"):
-        op = opv.get(pc)
-    else:
-        op = opv      # 有些 VM 上这一句直接算出了操作码本身
-    print("mode %d pc %d: op %s (array %s)" % (mode, pc, op, opname))
-    for nm, v in sorted(arrs.items()):
-        print("   %s[%d] = %s" % (nm, pc, fmt_any(v.get(pc))))
-    blk = vmmap.resolve(d["tree"], d["op"], op)
-    print(vmmap.text_of(lines, blk) if blk else "<no handler>")
+    print("no loop for mode", mode)
 
 
 def main():
@@ -3586,7 +3452,6 @@ class FunctionLifter:
             pid = self.prog.dump.pid_of_table.get(proto.tid)
             lines.insert(0, "-- proto %s" % (pid if pid is not None else "t%s" % proto.tid))
         self.stats["errors"] += nerr
-        self.stats["approx_carried"] = self.stats.get("approx_carried", 0) + getattr(lf, "approx_carried", 0)
         return lines
 
     def frame_regs(self, vm, vmobj, c, depth=0):

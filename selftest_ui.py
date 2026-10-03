@@ -9,8 +9,8 @@ bot.py 功能自检（不连 Discord）
   1. 指令解析：`.deobf` / `.help` / 老写法 `.deobf/14.7` / 已移除的 trace/strings/debug
   2. 加载反应：用户指令消息上先加 ⏳，完成后换成 ✅（失败换 ❌，help 直接收掉）
   3. 任务编号：XXXX-XXX 格式、不重复、工作目录名一致
-  4. 水印：交付的结果文件第一行是 `-- deobf by https://discord.gg/ck3k7nAVS`
-  5. 结果回执：标题 `✅ 任务 XXXX-XXX 完成`
+  4. 上游输出保持原样：机器人不注入水印、不生成深度诊断附件
+  5. 结果回执只发送一个主 Lua 文件，不发送日志 / 其他附件
 
 用法（需要 bin/ 里有能用的 luau / luau-ast）：
     python selftest_ui.py [样本文件]
@@ -23,6 +23,7 @@ import re
 import shutil
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -34,7 +35,7 @@ try:                                          # winpause.py 不在也能跑
 except ImportError:  # pragma: no cover
     def run_cli(fn, argv=None) -> int:
         return int(fn())
-from deobf_runner import WATERMARK, find_deobf_dir  # noqa: E402
+from deobf_runner import choose_frontend, find_deobf_dir  # noqa: E402
 
 FAILED: list[str] = []
 PASSED = 0
@@ -193,13 +194,30 @@ async def main() -> int:
         check(r is not None and "已经移除" in r.error, f"`.deobf {flag}` 给出『已移除』提示")
     r = P(".deobf 讲不通的参数", cfg)
     check(r is not None and r.error and ".help" in r.error, "未知参数提示指向 .help")
-    check(WATERMARK not in botmod.HELP_TEXT, "帮助里不出现水印（保持极简）")
+    check("http" not in botmod.HELP_TEXT, "帮助不包含额外链接（保持极简）")
     check(botmod.HELP_TEXT.count("\n") <= 5, "帮助是极简列表", repr(botmod.HELP_TEXT))
 
     # ---- 2) 任务编号 ----
     print("\n[2] 任务编号格式")
     work = Path(tempfile.mkdtemp(prefix="ui-selftest-"))
     b = make_bot(work)
+    selector = work / "result-filter"
+    selector.mkdir()
+    main_lua = selector / "sample.deob.lua"
+    trace_lua = selector / "sample.trace.luau"
+    main_lua.write_text("return 1\n", encoding="utf-8")
+    trace_lua.write_text("return 2\n", encoding="utf-8")
+    (selector / "sample.deob.部分反编译.lua").write_text("return 3\n", encoding="utf-8")
+    (selector / "job.log.txt").write_text("diagnostic\n", encoding="utf-8")
+    check(botmod.primary_lua_result(selector) == main_lua,
+          "结果筛选优先返回主 Lua，忽略诊断文件")
+    main_lua.unlink()
+    check(botmod.primary_lua_result(selector) == trace_lua,
+          "无静态文件时可回传行为追踪 Lua")
+    zip_path = botmod.DeobfBot._maybe_zip(None, trace_lua)
+    with zipfile.ZipFile(zip_path) as archive:
+        check(archive.namelist() == [trace_lua.name], "大结果 zip 只包含主 Lua 文件")
+    zip_path.unlink()
     ids = {b.job_queue.new_id() for _ in range(300)}
     check(len(ids) == 300, "编号不重复")
     check(all(re.fullmatch(r"\d{4}-\d{3}", i) for i in ids), "编号形如 XXXX-XXX",
@@ -256,42 +274,34 @@ async def main() -> int:
         dirs = [p.name for p in work.glob("job-*")]
         check(len(dirs) == 1 and re.fullmatch(r"job-\d{4}-\d{3}", dirs[0]),
               "工作目录名带新编号", repr(dirs))
-        outs = sorted((work / dirs[0] / "out").glob("*")) if dirs else []
-        check(bool(outs), "产出了结果文件", repr(outs))
-        if outs:
-            head = outs[0].read_text(encoding="utf-8", errors="replace").splitlines()[:1]
-            check(head and head[0] == f"-- {WATERMARK}", "结果文件第一行是水印", repr(head))
-            body = outs[0].read_text(encoding="utf-8", errors="replace")
-            for bad in ("dsc.gg", "Devirtualized with", "gpt 5.6"):
-                check(bad not in body, f"结果里没有解混淆器署名（{bad}）")
-        # 交付时带上文件
+        outdir = work / dirs[0] / "out" if dirs else work / "missing"
+        main_output = botmod.primary_lua_result(outdir)
+        check(main_output is not None, "定位到主 Lua 结果（不选中间诊断文件）", str(main_output))
+        if main_output:
+            body = main_output.read_text(encoding="utf-8", errors="replace")
+            check(not body.startswith("-- deobf by "), "结果未注入项目水印")
+        # 交付时只发送主 Lua 结果，不发送日志、深度捕获、部分反编译或预览。
         delivered = [f for m in ch.messages
                      for f in (getattr(m, "files", []) or getattr(m, "reply_files", []))]
-        check(bool(delivered), "结果文件已随消息发出", repr([getattr(f, 'filename', '?') for f in delivered]))
-        # v14 样本：自动附上三份深度清单（部分反编译 / 参考清单 / 反汇编）
         fnames = [getattr(f, "filename", "") for f in delivered]
-        check(any("部分反编译" in n for n in fnames), "附带「部分反编译」清单", repr(fnames))
-        check(any("参考清单" in n for n in fnames), "附带「参考清单」", repr(fnames))
-        check(any("反汇编" in n for n in fnames), "附带「逐条反汇编」", repr(fnames))
-        check(any(n.endswith(".deob.参考清单.txt") for n in fnames),
-              "清单文件名和主结果同前缀", repr(fnames))
+        check(len(delivered) == 1, "只回传一个结果文件", repr(fnames))
+        check(bool(fnames) and fnames[0].endswith((".deob.lua", ".trace.luau", ".deob.lua.zip", ".trace.luau.zip")),
+              "回传文件是主 Lua 脚本（或只含该脚本的 zip）", repr(fnames))
+        check(not any(any(tag in n for tag in ("部分反编译", "参考清单", "反汇编", "preview", ".log"))
+                      for n in fnames), "不回传诊断附件或截断预览", repr(fnames))
         emb = ch.messages[-1].embeds[0] if ch.messages and ch.messages[-1].embeds else None
-        check(bool(emb) and any(f.name == "另附" for f in emb.fields),
-              "结果卡片标出「另附」")
+        check(bool(emb) and not any(f.name == "另附" for f in emb.fields),
+              "结果卡片不列出诊断附件")
         await b.job_queue.stop()
 
-    # ---- 7) 水印幂等 & 保留正文 ----
-    print("\n[6] 水印：幂等、不动正文")
-    from deobf_runner import apply_watermark
-    f = work / "wm.lua"
-    f.write_text("-- Devirtualized with Luraph v14.8 engine\n\n-- [best effort] 说明\n\nlocal a = 1\n", encoding="utf-8")
-    apply_watermark(f)
-    once = f.read_text(encoding="utf-8")
-    apply_watermark(f)
-    twice = f.read_text(encoding="utf-8")
-    check(once == twice, "重复调用不叠加")
-    check("local a = 1" in once and "[best effort] 说明" in once, "正文和说明行都保留")
-    check(once.startswith(f"-- {WATERMARK}\n"), "水印在最顶上")
+    # ---- 7) 上游前端路由 ----
+    print("\n[6] 前端路由：交给对应的上游 CLI")
+    v14_kind, v14_version, _ = choose_frontend(
+        "-- This file was protected using Luraph Obfuscator v14.9\nreturn({})", "auto"
+    )
+    check((v14_kind, v14_version) == ("v14", "14.9"), "v14 横幅走上游 cli.py")
+    auto_kind, auto_version, _ = choose_frontend("local value = 1", "auto")
+    check((auto_kind, auto_version) == ("auto", "auto"), "其他输入交给上游 deob.py 自动识别")
     shutil.rmtree(work, ignore_errors=True)
 
     print("\n" + "=" * 64)

@@ -1,14 +1,16 @@
 # Luraph 解混淆 Discord 机器人
 
 在 Discord 里发一条指令 + 上传被 **Luraph** 保护的 Roblox Luau 脚本，
-机器人自动解混淆，跑完把结果文件发回频道。
+机器人自动解混淆；成功时只回传主结果 Lua 脚本（大文件可能用只含该脚本的 zip）。
 
 ```
 你：  .deobf   [附：protected.lua]
-机器人： 🛠 解混淆任务 #1 ▓▓▓▓▓░░░░░ 42%   🧠 反虚拟化（第 3 轮）
-机器人： ✅ 任务 #1 完成   引擎 Luraph v14.7 · 完整反虚拟化 · 18.3 秒 · 92 KB / 2140 行
+机器人： 🛠 任务 XXXX-XXX · 正在运行上游解混淆器
+机器人： ✅ 任务 XXXX-XXX 完成 · 上游已生成主 Lua 结果
         📎 protected.deob.lua
 ```
+
+结果大小与完整程度取决于上游引擎和输入样本；完成状态不保证已完整还原。
 
 底层调用 [KryptIT/luraph-v15-v14.x-deobfuscator](https://github.com/KryptIT/luraph-v15-v14.x-deobfuscator)：
 **v14.7 / v14.8 / v14.9** 走它的 `cli.py --engine`，**v15** 走 `deob.py --obfuscator luraph_v15`。
@@ -20,9 +22,9 @@
 | 文件 | 作用 |
 |---|---|
 | `bot.py` | 机器人本体：指令解析、任务队列、进度更新、结果回传 |
-| `deobf_runner.py` | 只负责调用解混淆器的一层封装（无 Discord 依赖，可单独命令行用） |
+| `deobf_runner.py` | 直接调用上游 CLI、管理进程和记录日志（无 Discord 依赖，可单独命令行用）；不改写输出 |
 | `selftest.py` | **不连 Discord** 的端到端自测，先证明这台机器能解混淆 |
-| `selftest_ui.py` | 用假的 Discord 对象把指令/反应/编号/水印整条链路自检一遍（33 项） |
+| `selftest_ui.py` | 用假的 Discord 对象检查指令、反应、主 Lua 文件筛选/回传及上游前端路由 |
 | `winpause.py` | Windows 双击运行 `.py` 的兜底：开控制台、修编码、结束时等回车（不让窗口闪退） |
 | `setup_wizard.py` | 一键安装的实现：查 Python、装依赖、检查/下载解混淆器与 Luau、生成 config、自检 |
 | `setup.bat` / `setup.ps1` / `setup.sh` | 三个平台的安装入口（Windows 双击 `setup.bat` 即可；`.ps1`/`.bat` 故意写成**纯 ASCII + CRLF**，避开 cmd/PowerShell 5.1 的代码页与 BOM 问题） |
@@ -30,9 +32,9 @@
 | `run.bat` / `run.sh` | 启动机器人（失败不自动重启，窗口留着让你看报错） |
 | `check.bat` | 双击做环境自检 |
 | `config.example.json` | 配置模板（复制成 `config.json`） |
-| `vendor/luraph-deobf/` | **已打包好的解混淆器**（清理过：37 MB → 5.5 MB，自带 Windows 版 `luau.exe` / `luau-ast.exe`） |
+| `vendor/luraph-deobf/` | 上游 KryptIT 解混淆器（固定到 commit `ed79a86`，引擎源码未打本地补丁；省略 Python 缓存和临时运行目录，含 Windows Luau 工具） |
 | `从这开始.txt` | 三步快速上手 |
-| `work/job-XXXX-XXX/` | 每个任务的输入、完整日志、输出文件（含上面那几份深度清单） |
+| `work/job-XXXX-XXX/` | 任务输入、上游日志和主 Lua 输出；Discord 只回传主 Lua 输出 |
 | `logs/bot.log` | 机器人运行日志 |
 
 ---
@@ -110,36 +112,13 @@ run.bat
 
 ## 结果怎么看
 
-| 结果类型 | 含义 |
-|---|---|
-| ✅ **完整反虚拟化** | VM 字节码被还原成可读 Luau，含控制流、函数、闭包 |
-| 🟡 **行为追踪** | 只包含**这次执行跑到**的代码路径，没执行到的分支不会出现；不是完整还原 |
+机器人交付的是**上游 CLI 写出的主 Lua 文件**。收到 ✅ 表示上游产出了可发送文件，**不等于保证完整恢复**；文件可能是静态反虚拟化结果，也可能是上游注明的行为追踪或部分结果。行为追踪仅覆盖样本本次实际执行到的路径。
 
-反面例子：脚本被 obfuscate 后有一堆没跑到的分支，行为追踪里就一条都不会有。
-v14.x 如果静态反虚拟化失败，机器人会自动加 `--trace-fallback` 重试一次并标注"回退"。
-拿不到完整结果时，可以在服务器上设环境变量 `DEVIRT_V14_KEEP_ALL=1 DEVIRT_V14_PARTIAL=1 DEVIRT_V14_LOOP_ONCE=1`
-再重跑同一个文件（14.7/14.9 这类样本用这个"完整配方"能拿到静态结果）。
+调用路径保持精简：v14.x 使用上游 `cli.py`（并启用其官方 `--trace-fallback` 选项），v15 使用上游 `deob.py --obfuscator luraph_v15`，其他输入交给 `deob.py` 自动识别。每个任务只启动一次上游前端，不在 bot 侧做版本重试、输出评分/改写或深度捕获。Lua 文件内容按上游原样交付；可能保留上游自身的注释或署名。Discord 只发送主 Lua 文件；文件超过上传限制时，尝试发送仅包含该 Lua 文件的 ZIP，ZIP 仍超限则不发送截断预览。日志保存在服务器 `work/job-XXXX-XXX/log.txt`，不会作为附件发送。
 
-结果文件顶部统一带水印：`-- deobf by https://discord.gg/ck3k7nAVS`；
-解混淆器自带的署名（`Devirtualized with … engine`、`dsc.gg/oxyenv` 等）会被自动去掉。
+**能力边界示例：**本次自测（2026-10-03）中，随仓库提供的 v14.7 / v14.8 / v14.9 三个样本，经固定上游 CLI（v14 使用其官方 `--trace-fallback`）分别产出 3 行 / 70 字节、7 行 / 301 字节、13 行 / 558 字节的行为追踪结果，不是完整源码。这只描述这三个 bundled sample 与本次运行，不能据此推断其他样本；换一种封装去调用同一上游版本也不会改变引擎能力。
 
-### 附带的「深度清单」（v14.7 / v14.8 / v14.9 自动带上）
-
-主结果之外，机器人还会再发 1～3 个附件。这些是拿运行时捕获的数据，直接调用解混淆器
-自带的调试接口（`devirt.py --raw / --lift`）生成的——**反虚拟化没走到的地方，看这几份**：
-
-| 附件 | 内容 | 为什么有用 |
-|---|---|---|
-| `<名字>.deob.部分反编译.lua` | 逐块 `--lift` 出来的**真 Luau 代码**，每段单独标注是否通过语法检查 | 主结果是「行为追踪」时最有用：14.9 主结果只有 39 行追踪，这里能多出 300+ 行真逻辑 |
-| `<名字>.deob.参考清单.txt` | 从捕获里整理出的 **API/函数引用**（`bit32.*`、`buffer.*`、`hookfunction`…）和**字符串常量**（去重，逐条列出） | 一眼看清这段脚本碰了哪些系统接口、里面写了什么文字 |
-| `<名字>.deob.反汇编.txt` | 寄存器级的**逐条反汇编**（每条 VM 指令做了什么、往哪跳） | 主结果缺的字节码在这里能看到；lifter 走不通的位置会标 `!!` |
-
-举例（同一个 14.9 样本）：主结果 39 行 / 1.5 KB，另外附
-`部分反编译.lua`（3 段、387 行真代码）、`参考清单.txt`（459 条字符串 / 62 个 API 引用）、
-`反汇编.txt`（34 万字节、631 个指令块）。
-
-跑一批下来总耗时会增加几秒（14.7 约 8 秒、14.8 约 12 秒、14.9 约 23 秒）。
-不想要这几份清单（比如只想省时间）时，设环境变量 `DEOBF_NO_DEEP_CAPTURE=1` 即可关掉。
+仓库中的 `样例输出/` 与《适配报告》是旧版本地适配时期的历史材料，不代表当前固定上游引擎的表现。旧版本地适配使用过的 `DEVIRT_V14_*` 环境变量配方已停用。
 
 ---
 
@@ -154,7 +133,7 @@ v14.x 如果静态反虚拟化失败，机器人会自动加 `--trace-fallback` 
 | `max_concurrent_jobs` | `1` | 同时跑几个任务。解混淆很吃 CPU，建议 1~2 |
 | `queue_size` | `20` | 队列上限，满了直接拒绝 |
 | `user_cooldown_seconds` | `60` | 每人提交冷却 |
-| `max_input_mb` / `max_upload_mb` | `25` / `8` | 输入上限 / 回传上限（超了自动打包 zip，再超就只发前 400 KB 预览） |
+| `max_input_mb` / `max_upload_mb` | `25` / `8` | 输入上限 / Lua 结果回传上限；超限时 zip 只包含主 Lua 文件，压缩后仍超限则不发送截断预览 |
 | `harness_timeout` | `150` | 传给解混淆器的单次运行超时（秒） |
 | `time_budget` | `30` | 被追踪脚本的时间预算（秒） |
 | `devirt_rounds` / `max_runs` | `200` / `12` | 反虚拟化轮数 / 陷阱重跑次数上限 |
@@ -217,19 +196,14 @@ Windows 用安装脚本下载的仓库自带 `bin\luau.exe`。Linux/macOS 官方
 常见原因：token 空着或写错（提示会说明）、没开 Message Content Intent、网络连不上 Discord。
 这三种情况 `bot.py` 都会用中文说清楚，窗口也不会关，照着做就行。
 
-**只能拿到"行为追踪"**
-版本现在是自动识别的（看文件头横幅，没有横幅就按 v14 系列依次试）；
-再加大预算：在 config.json 里调 `harness_timeout` / `time_budget` / `devirt_rounds`；
-还不行就去看 `work/job-XXXX/log.txt` 里的 `[!]` 警告——多半是"unresolved VM state"，说明这个样本还没被这个解混淆器完全支持。
+**只能拿到"行为追踪"或结果不完整**
+版本有横幅时按横幅选择上游前端；无横幅时，疑似 v14 的输入交给上游 `cli.py` 自己识别，其他输入交给上游 `deob.py` 自动识别。bot 不会跨版本重试或用本地恢复算法补结果。可以按需调整 `harness_timeout` / `time_budget` / `devirt_rounds`，并查看 `work/job-XXXX-XXX/log.txt`；上游仍可能无法完整恢复该样本。
 
 **同一个文件别人也能用吗？**
 能，机器人的权限用 `allowed_guild_ids` / `allowed_user_ids` 控制。
 
 **更新解混淆器**
-```bash
-cd vendor/luraph-deobf && git pull      # 用 git 装的
-```
-或者删掉 `vendor/luraph-deobf` 重新跑一次安装脚本。项目本身更新很快，遇到解不开的样本先更新再试。
+当前 `vendor/luraph-deobf/` 是仓库内固定快照（commit 见 `vendor/luraph-deobf/UPSTREAM.md`），不是独立 Git checkout，不能在其中直接 `git pull`。若要升级，请选择新的上游 commit 替换快照、更新 pin，并重新跑自测；不要把历史适配报告当成新版本的保证。
 
 ---
 

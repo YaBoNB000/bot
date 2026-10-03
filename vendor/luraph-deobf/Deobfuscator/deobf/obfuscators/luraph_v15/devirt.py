@@ -530,9 +530,7 @@ class VMModel:
 
     def maker_args(self, vmobj, proto, upvals):
         n = len(self.maker["args"])
-        # 参数表可能比 maker 形参个数长：upvals_index 有时正是 proto_index + 1，
-        # 只按 len(args) 分配会 IndexError（上游 issue #3 的修法）。
-        vals = [None] * max(n, 3, self.proto_index() + 1, self.upvals_index() + 1)
+        vals = [None] * max(n, 3)
         vals[0], vals[self.proto_index()], vals[self.upvals_index()] = vmobj, proto, upvals
         return vals
 
@@ -1476,17 +1474,7 @@ class ProtoLifter:
                                Multi([self.value_of(x) if x is not None else Const(None) for x in a.items])))
             return dst
         if is_sym(e):
-            # 末尾索引是符号值（多返回值顶部那份符号账）：别放弃整块，
-            # 直接把 table.move 原样生成出来 —— 读代码时正好能看出这里是搬寄存器。
-            # 只有参数确实渲染不出来才继续报错。
-            try:
-                margs = Multi([self.value_of(x) if x is not None else Const(None)
-                               for x in a.items])
-            except Unsupported:
-                raise Unsupported("table.move with symbolic end")
-            tt = self.new_temp()
-            self.emit(CallStmt(tt, Global("table.move"), margs))
-            return dst
+            raise Unsupported("table.move with symbolic end")
         n = e - f + 1
         for k in range(n):
             v = self.elem(src, f + k)
@@ -2945,21 +2933,6 @@ class Program:
             return s0, order, True
         return s0, order, False
 
-def _pick_loop(st, mode):
-    """挑出处理该 mode 的调度循环；v14.7 外层是 repeat...until false，
-    没有 mode 比较式，这时 loop 条件认不出来，直接用它唯一那个循环。"""
-    for i, ifn, w in st.loops:
-        c = st.conds.get(i)
-        if c is None:
-            continue
-        k = c["right"] if c["right"]["type"] == "AstExprConstantNumber" else c["left"]
-        if S.fix_int(k["value"]) == mode:
-            return i, ifn, w
-    if len(st.loops) == 1:
-        return st.loops[0]
-    return None
-
-
 def show_op(prog, key, mode, pc, force_op=None):
     cap = prog.dump.protos[key]
     vm = prog.vm_of(cap)
@@ -2967,38 +2940,33 @@ def show_op(prog, key, mode, pc, force_op=None):
                      LTable(), prog.globals)
     st = make_stepper(vm, lf)
     lines = prog.lines
-    picked = _pick_loop(st, mode)
-    if picked is None:
-        print("no loop for mode", mode)
+    for i, ifn, w in st.loops:
+        c = st.conds[i]
+        k = c["right"] if c["right"]["type"] == "AstExprConstantNumber" else c["left"]
+        if S.fix_int(k["value"]) != mode:
+            continue
+        d = [x for x in vmmap.find_dispatchers(prog.root) if x["node"] is w][0]
+        arrs = {}
+        for nm, keys in vm.maker_decls.items():
+            if len(keys) == 1 and keys[0] in lf.maker_scope.vars:
+                v = lf.maker_scope.vars[keys[0]]
+                if isinstance(v, LTable) and id(v) in lf.proto_arrays:
+                    arrs[nm] = v
+        # the loop's opcode array is named in the dispatch statement; resolve via VM scope aliases
+        opname = d["arr"]
+        cs = st.cs
+        it = S.Interp(lf)
+        _, inner = st._fresh_scopes(None, it)
+        stmt = w["body"]["body"][0]
+        opv = it.eval(stmt["values"][0]["expr"], inner)
+        op = opv.get(pc) if force_op is None else force_op
+        print("mode %d pc %d: op %s (array %s)" % (mode, pc, op, opname))
+        for nm, v in sorted(arrs.items()):
+            print("   %s[%d] = %s" % (nm, pc, fmt_any(v.get(pc))))
+        blk = vmmap.resolve(d["tree"], d["op"], op)
+        print(vmmap.text_of(lines, blk) if blk else "<no handler>")
         return
-    i, ifn, w = picked
-    d = [x for x in vmmap.find_dispatchers(prog.root) if x["node"] is w]
-    if not d:
-        print("no dispatcher for that loop")
-        return
-    d = d[0]
-    arrs = {}
-    for nm, keys in vm.maker_decls.items():
-        if len(keys) == 1 and keys[0] in lf.maker_scope.vars:
-            v = lf.maker_scope.vars[keys[0]]
-            if isinstance(v, LTable) and id(v) in lf.proto_arrays:
-                arrs[nm] = v
-    opname = d["arr"]
-    it = S.Interp(lf)
-    _, inner = st._fresh_scopes(None, it)
-    stmt = w["body"]["body"][0]
-    opv = it.eval(stmt["values"][0]["expr"], inner)
-    if force_op is not None:
-        op = force_op
-    elif hasattr(opv, "get"):
-        op = opv.get(pc)
-    else:
-        op = opv      # 有些 VM 上这一句直接算出了操作码本身
-    print("mode %d pc %d: op %s (array %s)" % (mode, pc, op, opname))
-    for nm, v in sorted(arrs.items()):
-        print("   %s[%d] = %s" % (nm, pc, fmt_any(v.get(pc))))
-    blk = vmmap.resolve(d["tree"], d["op"], op)
-    print(vmmap.text_of(lines, blk) if blk else "<no handler>")
+    print("no loop for mode", mode)
 
 
 def main():

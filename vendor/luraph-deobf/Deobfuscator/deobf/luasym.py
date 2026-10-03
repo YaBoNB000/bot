@@ -13,7 +13,6 @@ Values:
   and symbolic IR expressions (Expr subclasses, see below).
 """
 import math
-import os
 import struct
 
 
@@ -656,31 +655,12 @@ class Interp:
             a = self.eval(st["from"], scope)
             b = self.eval(st["to"], scope)
             c = self.eval(st["step"], scope) if st.get("step") else 1
-            if (a is None or b is None or c is None
-                    or is_sym(a) or is_sym(b) or is_sym(c)
-                    or not all(isinstance(x, (int, float)) and not isinstance(x, bool)
-                               for x in (a, b, c))):
-                # Partial v14.x mode: a flattened VM handler can carry a loop
-                # bound the walk cannot resolve yet.  Doing nothing there loses
-                # everything after the loop, so run the body once with the
-                # known initial value, keep the loop variable numeric, and say
-                # so in the output.  Only ever enabled for best-effort runs.
-                if not os.environ.get("DEVIRT_V14_LOOP_ONCE"):
-                    if a is None or b is None or c is None:
-                        raise Unsupported("numeric for with unknown bounds")
-                    if is_sym(a) or is_sym(b) or is_sym(c):
-                        raise Unsupported("numeric for with symbolic bounds")
-                    raise Unsupported("numeric for with non-numeric bounds")
-                inner = Scope(scope)
-                inner.vars[st["var"]["location"]] = a if isinstance(a, (int, float)) and not isinstance(a, bool) else 1
-                self.L.emit_once_marker(st) if hasattr(self.L, "emit_once_marker") else None
-                try:
-                    self.exec_block(st["body"]["body"], inner)
-                except BreakSig:
-                    pass
-                except ContinueSig:
-                    pass
-                return
+            if a is None or b is None or c is None:
+                raise Unsupported("numeric for with unknown bounds")
+            if is_sym(a) or is_sym(b) or is_sym(c):
+                raise Unsupported("numeric for with symbolic bounds")
+            if not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (a, b, c)):
+                raise Unsupported("numeric for with non-numeric bounds")
             if c == 0:
                 raise Unsupported("numeric for with zero step")
             i = a
@@ -711,22 +691,7 @@ class Interp:
                 if r[0] is None:
                     break
                 if is_sym(r[0]):
-                    if not os.environ.get("DEVIRT_V14_LOOP_ONCE"):
-                        raise Unsupported("symbolic generic for")
-                    # Partial v14.x mode: the iterator itself is symbolic (the
-                    # walk cannot follow it).  Run the body once so the
-                    # iteration's shape survives in the output, then stop
-                    # instead of aborting the whole function.
-                    inner = Scope(scope)
-                    for v, x in zip(st["vars"], r):
-                        inner.vars[v["location"]] = x
-                    try:
-                        self.exec_block(st["body"]["body"], inner)
-                    except BreakSig:
-                        pass
-                    except ContinueSig:
-                        pass
-                    break
+                    raise Unsupported("symbolic generic for")
                 ctl = r[0]
                 inner = Scope(scope)
                 for v, x in zip(st["vars"], r):

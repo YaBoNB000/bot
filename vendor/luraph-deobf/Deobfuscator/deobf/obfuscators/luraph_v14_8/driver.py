@@ -96,48 +96,6 @@ def patch_entries(source, path):
     return "\n".join(lines)
 
 
-#: 最近一次 _trace_root_candidates 看到的进入布局："host"（宿主直接调用）或
-#: "dispatch"（经 VM 调度循环，v14.9 布局）。给版本标注用。
-_LAST_ROOT_LAYOUT = "host"
-
-#: 布局判据只报告一次，避免重复日志
-_DISPATCH_LAYOUT_REPORTED = False
-
-
-def _vm_dispatch_payload_pid(chains):
-    """Payload pid one level below the VM dispatch prefix (v14.9 shape).
-
-    v14.7/v14.8 enter the payload chunk straight from the host, so its own
-    statements carry a single-frame marker.  v14.9 instead runs the chunk from
-    inside the VM dispatch loop, and every marker starts with the same
-    chunk -> VM -> ... prefix.  The payload root is the last frame of the
-    prefix that essentially every statement shares (the frames below it
-    differ per helper), i.e. the first frame that is *not* VM scaffolding.
-    """
-    chains = [c for c in chains if len(c) >= 2]
-    if not chains:
-        return None
-    total = len(chains)
-    out = None
-    for pos in range(0, 9):
-        counts = {}
-        for c in chains:
-            if len(c) > pos:
-                pid = c[pos][0]
-                counts[pid] = counts.get(pid, 0) + 1
-        if not counts:
-            break
-        pid, n = max(counts.items(), key=lambda kv: kv[1])
-        if pos >= 2 and n < max(2, 0.6 * total):
-            break
-        if pos >= 1 and not str(pid).isdigit():
-            break
-        out = pid
-    if out is None or not str(out).isdigit():
-        return None
-    return int(out)
-
-
 def _trace_root_candidates(body):
     """Rank likely payload-root pids from envlog call-chain markers.
 
@@ -148,15 +106,11 @@ def _trace_root_candidates(body):
     many statements in one/few invocations, and strongly penalize children
     that return to an emitting parent (the fingerprint/probe shape).
     """
-    all_chains = []
-    global _LAST_ROOT_LAYOUT
     scores = {}
     hits = {}
     invs = {}
     last_seen = {}
     last_child = {}
-    top_level = {}
-    _LAST_ROOT_LAYOUT = "host"
     pos = 0
     for line in body.splitlines():
         m = re.match(r"^\s*--@\d+\s*(.*)$", line)
@@ -168,7 +122,6 @@ def _trace_root_candidates(body):
             q = re.match(r"^(\d+):([^,\s]*)", part.strip())
             if q:
                 chain.append((int(q.group(1)), q.group(2)))
-        all_chains.append(chain)
         if len(chain) >= 2:
             parent, child = chain[0][0], chain[1][0]
             w = 5 + min(3, len(chain) - 2)
@@ -181,14 +134,6 @@ def _trace_root_candidates(body):
             last_child[parent] = child
         elif len(chain) == 1:
             parent = chain[0][0]
-            # A one-frame chain means the statement ran directly on top of the
-            # host stack: the host (or a fresh thread) called that proto, which
-            # is how Luraph enters the payload chunk.  Its own VM helpers are
-            # always called from inside it, so they never show up this way.
-            top_level[parent] = top_level.get(parent, 0) + 1
-            scores[parent] = scores.get(parent, 0) + 1
-            hits[parent] = hits.get(parent, 0) + 1
-            last_seen[parent] = pos
             child = last_child.get(parent)
             if child is not None:
                 scores[child] = scores.get(child, 0) - 18
@@ -202,27 +147,6 @@ def _trace_root_candidates(body):
         key=lambda p: (scores[p], hits.get(p, 0), last_seen.get(p, 0)),
         reverse=True,
     )
-    # Protos that own directly-entered statements are the payload chunk (or a
-    # callback the payload spawned); rank them first, by how much they ran.
-    # Everything the old heuristic favoured is kept as a fallback.
-    if top_level:
-        direct = sorted(top_level, key=lambda p: (top_level[p], hits.get(p, 0)), reverse=True)
-        ranked = direct + [p for p in ranked if p not in top_level]
-    else:
-        # No host-entered marker at all: this is the v14.9 layout, where the
-        # chunk is invoked by the VM dispatch loop and every marker carries the
-        # dispatch prefix.  Find the frame just below that prefix.
-        deep = _vm_dispatch_payload_pid(all_chains)
-        if deep is not None:
-            global _DISPATCH_LAYOUT_REPORTED
-            _LAST_ROOT_LAYOUT = "dispatch"
-            if not _DISPATCH_LAYOUT_REPORTED:
-                # 这个样本的 payload 是被 VM 调度循环调用的（v14.9 的引导布局），
-                # 而不是像 v14.7/v14.8 那样由宿主直接调用。给上层一个可读的判据。
-                _DISPATCH_LAYOUT_REPORTED = True
-                print("[*] payload is entered through the VM dispatch loop "
-                      "(v14.9 layout): root proto #%d" % deep, file=sys.stderr)
-            ranked = [deep] + [p for p in ranked if p != deep]
     return ranked
 
 
@@ -301,46 +225,6 @@ def _apply_root_hint(protos_json, body):
     elif os.environ.get("DEVIRT_DEBUG"):
         print("[*] payload root proto #%d confirmed by weighted runtime call chain" % hint, file=sys.stderr)
     return protos_json, hint
-
-
-def _lift_covers_trace(lifted, trace_src, min_ratio=0.6):
-    """True when the distinctive things the trace observed also appear in the lift.
-
-    A statement trace is only a better result than a large lift while the lift
-    is a skeleton.  If the lift already contains the payload's own literals and
-    environment calls that the trace saw, it is strictly richer (it also holds
-    the branches that never ran), so it must not be swapped for the short trace.
-    """
-    if not lifted or not trace_src:
-        return False
-    keys = set(re.findall(r'"([^"\n]{6,})"', trace_src))
-    keys.update(re.findall(r"\b(?:game|Instance|task|Players|HttpService|StarterGui|workspace|"
-                           r"loadstring|HttpGet|GetService)\b", trace_src))
-    if not keys:
-        return False
-    hit = sum(1 for k in keys if k in lifted)
-    return hit >= max(1, int(len(keys) * min_ratio))
-
-
-def _lift_is_skeleton(text):
-    """True when a lift is only a skeleton, not usable source.
-
-    Two shapes are skeletons: the walk stopped everywhere and the body is
-    nothing but calls into unresolved runtime helpers, or the still-encrypted
-    string pool got dumped as one enormous literal line.  A large lift that is
-    real code (even with a few unresolved helpers) is not a skeleton and must
-    not be swapped for a lower-scoring but empty alternative root.
-    """
-    if not text:
-        return True
-    lines = text.splitlines()
-    if any(len(ln) > 4000 for ln in lines):
-        return True
-    code = [ln for ln in lines if ln.strip() and not ln.lstrip().startswith("--")]
-    if not code:
-        return True
-    stubs = [ln for ln in code if "luraph_runtime" in ln or "the caller's registers" in ln]
-    return bool(stubs) and len(stubs) / len(code) > 0.5
 
 
 def _v14_probe_signature_score(code):
@@ -463,40 +347,13 @@ def _strip_v14_probe_suite(code):
     return code
 
 
-def _payload_statement_inv(chain, root_pid, deep=False):
-    """Invocation id of the payload frame for one marker chain, or None.
-
-    The default (shallow) rule is the v14.7/v14.8 layout: the host enters the
-    payload chunk directly, so the marker's second element *is* the payload
-    frame and its invocation id groups the payload's statements.  v14.9 runs
-    the chunk from inside the VM dispatch loop instead, so its payload frame
-    appears deeper in the chain; `deep=True` accepts the root pid anywhere in
-    the chain (and treats a single-frame marker as the payload frame itself).
-    """
-    if not chain:
-        return None
-    want = str(root_pid)
-    if deep:
-        if str(chain[0][0]) == want:
-            return chain[0][1] or ""
-        for pid, inv in chain[1:]:
-            if str(pid) == want:
-                return inv or ""
-        return None
-    if len(chain) >= 2 and str(chain[1][0]) == want:
-        return chain[1][1] or ""
-    return None
-
-
 def _payload_trace_source(body, root_pid):
     """Source-like statements attributed to the final payload invocation.
 
     v14.x often executes environment probes in an earlier invocation of the
     same proto that later executes the user chunk.  Group by the marker's
     invocation id and keep the latest invocation, then strip the narrowly
-    recognized Luraph probe suite.  Protos that only ever lift partially may
-    still be attributed here, so the caller gets the payload's own statements
-    even when the static lift cannot finish.
+    recognized Luraph probe suite.
     """
     if root_pid is None:
         return None
@@ -504,30 +361,23 @@ def _payload_trace_source(body, root_pid):
         import fold
         lines = body.splitlines()
         items = fold.parse(lines, 0, len(lines))
+        groups = {}
+        order = []
 
-        def collect(matcher):
-            groups = {}
-            order = []
+        def visit(xs):
+            for it in xs:
+                if isinstance(it, fold.Stmt):
+                    chain = it.chain
+                    if len(chain) >= 2 and chain[1][0] == str(root_pid):
+                        inv = chain[1][1] or ""
+                        if inv not in groups:
+                            groups[inv] = []
+                            order.append(inv)
+                        groups[inv].extend(fold.render([it]))
+                    else:
+                        visit(it.items)
 
-            def visit(xs):
-                for it in xs:
-                    if isinstance(it, fold.Stmt):
-                        inv = matcher(it.chain)
-                        if inv is not None:
-                            if inv not in groups:
-                                groups[inv] = []
-                                order.append(inv)
-                            groups[inv].extend(fold.render([it]))
-                        else:
-                            visit(it.items)
-
-            visit(items)
-            return groups, order
-
-        groups, order = collect(lambda c: _payload_statement_inv(c, root_pid))
-        if not groups:
-            # The payload frame sits below the VM dispatch frames (v14.9).
-            groups, order = collect(lambda c: _payload_statement_inv(c, root_pid, deep=True))
+        visit(items)
         if not groups:
             return None
 
@@ -546,6 +396,9 @@ def _payload_trace_source(body, root_pid):
         return code.strip() or None
     except Exception:
         return None
+
+
+
 def _observable_trace_source(body):
     """Recover compact, directly-observed payload side effects from a v14 trace.
 
@@ -618,12 +471,6 @@ def _v14_scaffold_score(text):
 
 
 def _looks_like_v14_scaffolding(text):
-    # DEVIRT_V14_KEEP_ALL=1 keeps even VM-scaffolding-looking output: for
-    # samples whose payload root cannot be isolated the partial lift is still
-    # the most useful thing the engine can produce, and refusing it leaves the
-    # caller with nothing.
-    if os.environ.get("DEVIRT_V14_KEEP_ALL"):
-        return False
     return _v14_scaffold_score(text) >= 24
 
 
@@ -657,27 +504,10 @@ def _set_dump_root(ppath, pid):
         if str(pid) not in data.get("protos", {}):
             return False
         data["root_callee"] = int(pid)
-        Path(ppath).write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8", newline="\n")
+        Path(ppath).write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8", newline="\\n")
         return True
     except Exception:
         return False
-
-def _restore_root_hint(job, ppath):
-    """Re-apply the trace-derived payload root to a dump that a rerun rewrote.
-
-    The harness prints its own PROTO json on every run and that copy has no
-    root hint, so without this the final lift silently falls back to the
-    bootstrap proto (pid 1) and the output is VM scaffolding instead of the
-    payload.  Only a pid that is actually present is accepted.
-    """
-    hint = getattr(job, "root_hint", None)
-    if hint is None:
-        return
-    try:
-        _set_dump_root(ppath, hint)
-    except Exception:
-        pass
-
 
 def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
     """Lift the captured protos; constants that only Luraph's lazy decoder can
@@ -716,16 +546,9 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
                 for rq in sorted(new):
                     print("[*]     request %s" % rq, file=sys.stderr)
             if (not new and stats.get("errors", 0) and not os.environ.get("DEVIRT_V14_PARTIAL")):
-                # The walk stopped on VM state it cannot follow.  That does not
-                # mean the sample is hopeless: run the partial structuring pass
-                # once and let the caller decide (a large partial lift that is
-                # real code beats a statement trace for anything that has to be
-                # read or edited; a lift that is just one literal blob does
-                # not, and is still rejected below).
-                print("[*] v14.x quick walk has %d unresolved VM state(s); attempting the partial structuring pass"
+                print("[!] v14.x quick walk has %d unresolved VM state(s); skipping expensive partial structuring"
                       % stats["errors"], file=sys.stderr)
-                os.environ["DEVIRT_V14_PARTIAL"] = "1"
-                full = True
+                return False
             if (not new and devirt.same_patches(last_bufs, bufs)) or rnd == rounds:
                 full = True
         if full:
@@ -745,18 +568,8 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
                 text = cleaned_text
             base_score = (10 ** 6) if probe_only else _v14_scaffold_score(text or "")
             candidates, current_root = _dump_root_candidates(ppath)
-            # DEVIRT_V14_KEEP_ALL keeps the trace-derived root instead of
-            # hunting for a lower-scoring alternate: on these samples the real
-            # payload legitimately contains VM-ish shapes and the alternates
-            # are small helper protos that score 0 but hold no payload.
-            # Scanning alternate roots is for a root that only produced
-            # scaffolding *stubs*.  A root whose lift is real code is kept even
-            # when it scores high: v14 payloads legitimately contain VM-ish
-            # shapes, and the alternates are small helpers with no payload.
-            if ((base_score >= 24 and _lift_is_skeleton(text or "")) or probe_only) \
-                    and len(candidates) > 1 and not os.environ.get("DEVIRT_V14_KEEP_ALL"):
+            if (base_score >= 24 or probe_only) and len(candidates) > 1:
                 best = (base_score, text, stats, reqs, bufs, current_root)
-                best_rank = (_lift_is_skeleton(text or ""), base_score, stats.get("errors", 0))
                 reason = "anti-tamper probe-only root" if probe_only else "VM/bootstrap scaffolding"
                 print("[!] selected v14 root is %s (score %d); scanning alternate roots"
                       % (reason, base_score), file=sys.stderr)
@@ -782,21 +595,14 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
                     if aclean.strip() and aclean != araw:
                         atext = aclean
                     ascore = (10 ** 6) if aprobe_only else _v14_scaffold_score(atext or "")
-                    askel = _lift_is_skeleton(atext or "")
                     label = "probe-only" if aprobe_only else "candidate"
-                    print("[*]   root #%d: %s score %d, %d unlifted block(s), %s (%.1fs)"
-                          % (pid, label, ascore, astats.get("errors", 0),
-                             "skeleton" if askel else "real code", time.time() - at0), file=sys.stderr)
-                    # Rank by (skeleton, scaffolding/probe score, unresolved VM
-                    # states).  A lower-scoring root that lifts nothing but
-                    # stubs must never replace a root that lifts real payload
-                    # code, which is what happens on samples whose payload
-                    # legitimately contains VM-ish shapes.
-                    rank = (askel, ascore, astats.get("errors", 0))
-                    if rank < best_rank:
-                        best_rank = rank
+                    print("[*]   root #%d: %s score %d, %d unlifted block(s) (%.1fs)"
+                          % (pid, label, ascore, astats.get("errors", 0), time.time() - at0), file=sys.stderr)
+                    # Scaffolding/probe score is the primary signal.  On a tie
+                    # prefer the candidate with fewer unresolved VM states.
+                    if (ascore, astats.get("errors", 0)) < (best[0], best[2].get("errors", 0)):
                         best = (ascore, atext, astats, areqs, abufs, pid)
-                    if not askel and ascore < 24 and astats.get("errors", 0) == 0:
+                    if ascore < 24 and astats.get("errors", 0) == 0:
                         break
                 _, text, stats, reqs, bufs, chosen_root = best
                 if chosen_root is not None:
@@ -833,8 +639,6 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
             break
         with open(ppath, "w", encoding="utf-8", newline="\n") as f:
             f.write(m.group(1))
-        _restore_root_hint(job, ppath)
-    _restore_root_hint(job, ppath)
     finished = devirt.finish_text(text or "").strip()
     # The selected proto may be the v14 Roblox anti-analysis fingerprint.
     # Strip only the strongly-recognized probe suite; if nothing remains, this
@@ -850,27 +654,12 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None):
         print("[!] refusing v14 static output: selected root is still Luraph VM/bootstrap scaffolding",
               file=sys.stderr)
         return False
-    header = job.credit_header() + _best_effort_note(finished)
+    header = job.credit_header()
     job.write(dpath, header + finished + "\n")
     return True
 
 
-def _best_effort_note(text=""):
-    """Header line for best-effort output.  Says what actually happened: with
-    zero un-lifted blocks it must not claim to be a partial lift."""
-    if not os.environ.get("DEVIRT_V14_KEEP_ALL"):
-        return ""
-    n = text.count('error("devirt')
-    if n == 0:
-        return ("-- [best effort] 完整反虚拟化：每个 VM 代码块都还原成了 Luau，正文没有\n"
-                "-- 留下 error(\"devirt: ...\") 中断标记。（运行期构造、解不开的 VM 辅助闭包\n"
-                "-- 仍保留为具名桩函数。）\n\n")
-    return ("-- [best effort] 部分还原：正文有 %d 处 VM 状态没跟上，标记之前的代码是\n"
-            "-- 正常还原的（见 error(\"devirt: ...\") 那几行）。\n"
-            "-- Set DEVIRT_V14_STRICT_ONLY=1 to get the strict behaviour back.\n\n" % n)
-
-
-def _run_strict(job):
+def run(job):
     """The whole Luraph pipeline; returns the result file's path."""
     args = job.args
     devirt_on = not args.no_devirt
@@ -1115,10 +904,6 @@ def _run_strict(job):
                 # the lifter needs the original source of every VM chunk
                 chunk_paths = [job.write(job.path(".chunk_%s.luau" % key), src, encoding="latin-1")
                                for key, src in raw_chunks.items()]
-                # The trace-derived payload root must survive the constant rounds:
-                # every rerun rewrites the dump from the harness output, which
-                # carries no hint, so devirt would fall back to the bootstrap proto.
-                job.root_hint = root_hint
                 lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath, chunk_paths)
     runner.finish()
     trace.status_line(body)
@@ -1162,15 +947,7 @@ def _run_strict(job):
                 (("print(" in semantic and "print(" not in lifted) or
                  ("warn(" in semantic and "warn(" not in lifted))
             )
-            # A lift is only "unusable" when it is a skeleton: mostly calls
-            # into unresolved runtime helpers, or one giant literal blob (the
-            # payload's still-encrypted string pool dumped as a string).  A
-            # large lift that is real code stays the better result.
-            lift_is_skeleton = _lift_is_skeleton(lifted)
-            keep_all = bool(os.environ.get("DEVIRT_V14_KEEP_ALL"))
-            if (not keep_all) and ((unresolved and lift_is_skeleton) or static_missed_observable
-                                   or (llines > 200 and llines > slines * 20
-                                       and not _lift_covers_trace(lifted, semantic))):
+            if unresolved or static_missed_observable or (llines > 200 and llines > slines * 10):
                 return write_semantic_candidate(semantic)
 
         nil_calls = lifted.count("(nil)(")
@@ -1268,28 +1045,3 @@ def lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath, chunk_paths)
     finally:
         if server[0] is not None:
             server[0].close()
-
-
-def run(job):
-    """Strict first, best effort second.
-
-    The strict pass refuses output that still looks like Luraph's own VM
-    scaffolding, because handing back VM internals as "deobfuscated source" is
-    worse than returning nothing.  Some samples only ever lift partially (a
-    loop bound or an iterator the symbolic walk cannot resolve yet), and for
-    those the partial lift is exactly what the user wants: run the strict pass
-    again with the partial switches on and label the result.
-    """
-    try:
-        return _run_strict(job)
-    except Exception as exc:                     # noqa: BLE001 - re-raised below
-        if getattr(job, "_v14_best_effort", False) or os.environ.get("DEVIRT_V14_STRICT_ONLY"):
-            raise
-        job._v14_best_effort = True
-        os.environ["DEVIRT_V14_PARTIAL"] = "1"
-        os.environ["DEVIRT_V14_LOOP_ONCE"] = "1"
-        os.environ["DEVIRT_V14_KEEP_ALL"] = "1"
-        print("[!] strict devirtualization gave no result (%s: %s);\n"
-              "    retrying in best-effort mode - the output will be labelled as partial"
-              % (type(exc).__name__, str(exc)[:160]), file=sys.stderr)
-        return _run_strict(job)

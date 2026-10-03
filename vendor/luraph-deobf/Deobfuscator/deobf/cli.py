@@ -131,13 +131,10 @@ class Job:
                 p.write_text(str(data), encoding="utf-8", newline="")
         return str(p)
 
-    #: 结果文件顶部的水印（署名）。想换成别的水印只改这一行。
-    WATERMARK = "deobf by https://discord.gg/ck3k7nAVS"
-
     def credit_header(self) -> str:
         if self.args.no_credit:
             return ""
-        return f"-- {self.WATERMARK}\n\n"
+        return f"-- Devirtualized with Luraph v{self.args.engine_resolved} engine\n\n"
 
 
 def parser() -> argparse.ArgumentParser:
@@ -293,17 +290,6 @@ def main(argv=None) -> int:
 
         print(str(output))
         eprint(f"[+] wrote: {output}")
-        # 折叠掉的 VM 数据表放在 <输出>.full.lua 里（折叠前的完整版），
-        # 想核对数据时用它。
-        try:
-            import backend as _be
-            full = getattr(_be, "LAST_FULL_TEXT", "")
-            if full and "已折叠" in output.read_text(encoding="utf-8", errors="replace"):
-                full_path = output.with_name(output.name + ".full.lua")
-                full_path.write_text(full, encoding="utf-8", newline="\n")
-                eprint(f"[+] wrote: {full_path}（完整版，含全部数据表）")
-        except Exception as exc:                                    # noqa: BLE001
-            eprint(f"[!] 完整版写出失败：{exc}")
         return 0
     finally:
         if cleanup:

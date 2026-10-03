@@ -6,7 +6,6 @@ Usage: python obfuscators/luraph_v14_8/vmmap.py <protected.luau> [dispatch_index
 """
 import json
 import os
-import re
 import subprocess
 import sys
 
@@ -623,56 +622,10 @@ def _outer_captures(info):
     for key, name in found.items():
         by_name.setdefault(name, []).append(key)
 
-    # A duplicate visible name can refer to several shadowed declarations.
-    # Instead of discarding the name (which silently drops captures the VM
-    # closure needs, e.g. the factory's VM-object parameter), keep the
-    # declaration that is actually in scope at the insertion point: the one
-    # whose source span ends last before the binding statement.
-    def _span(key):
-        m = re.fullmatch(r"(\d+),(\d+) - (\d+),(\d+)", str(key))
-        return tuple(int(x) for x in m.groups()) if m else None
-
-    at = info.get("at")
-    mk = info.get("maker")
-    keep = set()
-    for name, keys in by_name.items():
-        if len(keys) == 1:
-            keep.add(keys[0])
-            continue
-        if at is None:
-            continue
-        # A name that is also declared *inside* the maker (a nested closure's
-        # local) is not the binding the VM closure uses: only declarations
-        # from enclosing scopes can be.  Prefer those; then take the one whose
-        # span ends last before the insertion point.
-        mspan = _span(mk.get("location")) if isinstance(mk, dict) else None
-
-        mstart = (mspan[0], mspan[1]) if mspan else None
-        mend = (mspan[2], mspan[3]) if mspan else None
-
-        def outside(key):
-            s = _span(key)
-            if s is None or mstart is None:
-                return True
-            return not (mstart <= (s[0], s[1]) and (s[2], s[3]) <= mend)
-
-        cands = [k for k in keys if outside(k)] or list(keys)
-        best = None
-        for key in cands:
-            s = _span(key)
-            if s is None:
-                continue
-            if (s[0], s[1]) >= tuple(at):
-                continue                      # declared after the insertion point
-            if best is None or (s[2], s[3]) > best[0]:
-                best = ((s[2], s[3]), key)
-        if best is not None:
-            keep.add(best[1])
-
     out = []
     idx = 0
     for key, name in sorted(found.items(), key=lambda kv: repr(kv[0])):
-        if key not in keep:
+        if len(by_name[name]) != 1:
             continue
         idx += 1
         out.append({"decl": key, "name": name, "field": "__venv%d" % idx})

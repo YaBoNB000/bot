@@ -1,0 +1,6 @@
+2026-10-03 11:20:51 WARNING discord.client: PyNaCl is not installed, voice will NOT be supported
+2026-10-03 11:20:51 WARNING discord.client: davey is not installed, voice will NOT be supported
+2026-10-03 11:20:52 INFO    deobf-bot: worker-0 就绪
+2026-10-03 11:20:53 INFO    deobf-bot: 斜杠命令已同步（全局，可能延迟 1 小时）
+2026-10-03 11:20:56 INFO    deobf-bot: 登录成功：Luraph Deobf#4529（1555557598865133580）| 解混淆器：D:\luraph-bot\vendor\luraph-deobf\Deobfuscator\deobf
+2026-10-03 11:33:37 INFO    deobf-bot: 任务 6550-103 结束 ok=True 模式=devirt 用时=729.8s 输出=D:\luraph-bot\work\job-6550-103\out\input.deob.lua

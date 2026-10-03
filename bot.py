@@ -10,11 +10,10 @@ Luraph 解混淆 Discord 机器人
     .help                        -> 指令列表
     斜杠命令：/deobf、/help、/stats
 
-结果文件顶部会自动带上水印：deobf by https://discord.gg/ck3k7nAVS
-（解混淆器自带的 Discord 署名会被去掉，见 deobf_runner.apply_watermark）
+解混淆结果保持上游 CLI 的原样；机器人只负责进程管理和回传主 Lua 文件，不改写脚本内容。
 
-底层调用的是 KryptIT/luraph-v15-v14.x-deobfuscator（见 deobf_runner.py）：
-v14.7/14.8/14.9 走 cli.py，v15 走 deob.py --obfuscator luraph_v15。
+底层调用 KryptIT/luraph-v15-v14.x-deobfuscator（见 deobf_runner.py）：
+v14.x 走上游 `cli.py`，v15 走上游 `deob.py --obfuscator luraph_v15`，其他输入交给上游自动识别。
 
 启动：
     python bot.py            # 读 config.json / 环境变量
@@ -823,8 +822,8 @@ class DeobfBot(discord.Client):
 
         # keep_work=false 时不留上传的原脚本（结果和日志保留，方便重发/排查）
         if not self.cfg.get("keep_work", True):
-            # 深度捕获的工作目录（动辄 1～2 MB 的 protos.json）也一并清掉
-            for junk in list(job.workdir.glob(".*_work")) + [job.workdir / "deep"]:
+            # 一并清理上游 CLI 留下的临时工作目录（如果有）。
+            for junk in job.workdir.glob(".*_work"):
                 try:
                     if junk.is_dir():
                         shutil.rmtree(junk, ignore_errors=True)

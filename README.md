@@ -5,10 +5,12 @@
 
 ```
 你：  .deobf   [附：protected.lua]
-机器人： 🛠 解混淆任务 #1 ▓▓▓▓▓░░░░░ 42%   🧠 反虚拟化（第 3 轮）
-机器人： ✅ 任务 #1 完成   引擎 Luraph v14.7 · 完整反虚拟化 · 18.3 秒 · 92 KB / 2140 行
+机器人： 🛠 任务 XXXX-XXX · 正在运行上游解混淆器
+机器人： ✅ 任务 XXXX-XXX 完成 · 上游已生成主 Lua 结果
         📎 protected.deob.lua
 ```
+
+结果大小与完整程度取决于上游引擎和输入样本；完成状态不保证已完整还原。
 
 底层调用 [KryptIT/luraph-v15-v14.x-deobfuscator](https://github.com/KryptIT/luraph-v15-v14.x-deobfuscator)：
 **v14.7 / v14.8 / v14.9** 走它的 `cli.py --engine`，**v15** 走 `deob.py --obfuscator luraph_v15`。
@@ -20,9 +22,9 @@
 | 文件 | 作用 |
 |---|---|
 | `bot.py` | 机器人本体：指令解析、任务队列、进度更新、结果回传 |
-| `deobf_runner.py` | 只负责调用解混淆器的一层封装（无 Discord 依赖，可单独命令行用） |
+| `deobf_runner.py` | 直接调用上游 CLI、管理进程和记录日志（无 Discord 依赖，可单独命令行用）；不改写输出 |
 | `selftest.py` | **不连 Discord** 的端到端自测，先证明这台机器能解混淆 |
-| `selftest_ui.py` | 用假的 Discord 对象检查指令、反应、主 Lua 文件筛选/回传与水印（39 项） |
+| `selftest_ui.py` | 用假的 Discord 对象检查指令、反应、主 Lua 文件筛选/回传及上游前端路由 |
 | `winpause.py` | Windows 双击运行 `.py` 的兜底：开控制台、修编码、结束时等回车（不让窗口闪退） |
 | `setup_wizard.py` | 一键安装的实现：查 Python、装依赖、检查/下载解混淆器与 Luau、生成 config、自检 |
 | `setup.bat` / `setup.ps1` / `setup.sh` | 三个平台的安装入口（Windows 双击 `setup.bat` 即可；`.ps1`/`.bat` 故意写成**纯 ASCII + CRLF**，避开 cmd/PowerShell 5.1 的代码页与 BOM 问题） |
@@ -32,7 +34,7 @@
 | `config.example.json` | 配置模板（复制成 `config.json`） |
 | `vendor/luraph-deobf/` | 上游 KryptIT 解混淆器（固定到 commit `ed79a86`，引擎源码未打本地补丁；省略 Python 缓存和临时运行目录，含 Windows Luau 工具） |
 | `从这开始.txt` | 三步快速上手 |
-| `work/job-XXXX-XXX/` | 任务输入、日志、主 Lua 输出与可能的内部诊断文件；Discord 只回传主 Lua 输出 |
+| `work/job-XXXX-XXX/` | 任务输入、上游日志和主 Lua 输出；Discord 只回传主 Lua 输出 |
 | `logs/bot.log` | 机器人运行日志 |
 
 ---
@@ -110,30 +112,13 @@ run.bat
 
 ## 结果怎么看
 
-| 结果类型 | 含义 |
-|---|---|
-| ✅ **完整反虚拟化** | VM 字节码被还原成可读 Luau，含控制流、函数、闭包 |
-| 🟡 **行为追踪** | 只包含**这次执行跑到**的代码路径，没执行到的分支不会出现；不是完整还原 |
+机器人交付的是**上游 CLI 写出的主 Lua 文件**。收到 ✅ 表示上游产出了可发送文件，**不等于保证完整恢复**；文件可能是静态反虚拟化结果，也可能是上游注明的行为追踪或部分结果。行为追踪仅覆盖样本本次实际执行到的路径。
 
-反面例子：脚本被 obfuscate 后有一堆没跑到的分支，行为追踪里就一条都不会有。
-v14.x 如果静态反虚拟化失败，机器人会自动加 `--trace-fallback` 重试一次并标注"回退"。
-拿不到完整结果时，以当前上游引擎的实际输出为准；管理员可在服务器的 `work/job-XXXX-XXX/log.txt` 查看日志和内部诊断文件。Discord 回复只包含主 Lua 输出，不发送日志、反汇编或部分反编译附件。旧版本地适配使用过的 `DEVIRT_V14_*` 环境变量配方已停用。
+调用路径保持精简：v14.x 使用上游 `cli.py`（并启用其官方 `--trace-fallback` 选项），v15 使用上游 `deob.py --obfuscator luraph_v15`，其他输入交给 `deob.py` 自动识别。每个任务只启动一次上游前端，不在 bot 侧做版本重试、输出评分/改写或深度捕获。Lua 文件内容按上游原样交付；可能保留上游自身的注释或署名。Discord 只发送主 Lua 文件；文件超过上传限制时，尝试发送仅包含该 Lua 文件的 ZIP，ZIP 仍超限则不发送截断预览。日志保存在服务器 `work/job-XXXX-XXX/log.txt`，不会作为附件发送。
 
-结果文件顶部统一带水印：`-- deobf by https://discord.gg/ck3k7nAVS`；
-解混淆器自带的署名（`Devirtualized with … engine`、`dsc.gg/oxyenv` 等）会被自动去掉。
+**能力边界示例：**本次自测（2026-10-03）中，随仓库提供的 v14.7 / v14.8 / v14.9 三个样本，经固定上游 CLI（v14 使用其官方 `--trace-fallback`）分别产出 3 行 / 70 字节、7 行 / 301 字节、13 行 / 558 字节的行为追踪结果，不是完整源码。这只描述这三个 bundled sample 与本次运行，不能据此推断其他样本；换一种封装去调用同一上游版本也不会改变引擎能力。
 
-### 深度诊断文件（仅保存在服务器，不随 `.deobf` 回复发送）
-
-v14 任务可能根据运行时捕获数据，通过上游调试接口（`devirt.py --raw / --lift`）生成以下内部诊断文件。
-Discord 成功回复只发送主 Lua 输出；这些辅助文件、日志和中间文件不会作为附件回传。
-
-| 内部文件 | 内容 | 用途 |
-|---|---|---|
-| `<名字>.deob.部分反编译.lua` | 逐块 `--lift` 出来的 Luau 片段，每段单独标注语法检查结果 | 主结果较短时可供辅助分析；片段之间可能不连贯，不能视作完整源码 |
-| `<名字>.deob.参考清单.txt` | 从捕获里整理出的 **API/函数引用**（`bit32.*`、`buffer.*`、`hookfunction`…）和**字符串常量**（去重，逐条列出） | 一眼看清这段脚本碰了哪些系统接口、里面写了什么文字 |
-| `<名字>.deob.反汇编.txt` | 寄存器级的**逐条反汇编**（每条 VM 指令做了什么、往哪跳） | 主结果缺的字节码在这里能看到；lifter 走不通的位置会标 `!!` |
-
-这些诊断文件的内容和耗时会随样本、上游版本及运行环境变化；不等于完整源码。若要节省运行时间，可设 `DEOBF_NO_DEEP_CAPTURE=1` 关闭内部深度捕获。仓库中的 `样例输出/` 与《适配报告》是旧版本地适配时期的历史材料，不代表当前固定上游引擎的表现。
+仓库中的 `样例输出/` 与《适配报告》是旧版本地适配时期的历史材料，不代表当前固定上游引擎的表现。旧版本地适配使用过的 `DEVIRT_V14_*` 环境变量配方已停用。
 
 ---
 
@@ -211,10 +196,8 @@ Windows 用安装脚本下载的仓库自带 `bin\luau.exe`。Linux/macOS 官方
 常见原因：token 空着或写错（提示会说明）、没开 Message Content Intent、网络连不上 Discord。
 这三种情况 `bot.py` 都会用中文说清楚，窗口也不会关，照着做就行。
 
-**只能拿到"行为追踪"**
-版本现在是自动识别的（看文件头横幅，没有横幅就按 v14 系列依次试）；
-再加大预算：在 config.json 里调 `harness_timeout` / `time_budget` / `devirt_rounds`；
-还不行就去看 `work/job-XXXX/log.txt` 里的 `[!]` 警告——多半是"unresolved VM state"，说明这个样本还没被这个解混淆器完全支持。
+**只能拿到"行为追踪"或结果不完整**
+版本有横幅时按横幅选择上游前端；无横幅时，疑似 v14 的输入交给上游 `cli.py` 自己识别，其他输入交给上游 `deob.py` 自动识别。bot 不会跨版本重试或用本地恢复算法补结果。可以按需调整 `harness_timeout` / `time_budget` / `devirt_rounds`，并查看 `work/job-XXXX-XXX/log.txt`；上游仍可能无法完整恢复该样本。
 
 **同一个文件别人也能用吗？**
 能，机器人的权限用 `allowed_guild_ids` / `allowed_user_ids` 控制。

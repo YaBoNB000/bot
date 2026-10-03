@@ -92,7 +92,6 @@ class Options:
     debug: bool = False            # 保留全部中间文件
     harness_timeout: int = 150     # 单次运行的硬超时（秒）
     budget: int = 30               # 被追踪脚本的时间预算（秒）
-    complete_v14: bool = True      # v14 用「完整配方」（最完整，代价是慢：14.7 约 8 分钟）
     rounds: int = 200              # 反虚拟化轮数上限
     max_runs: int = 12             # 陷阱重跑次数上限
 
@@ -120,7 +119,7 @@ class Result:
     ok: bool = False
     output: Path | None = None
     engine: str = ""               # 人类可读的引擎名，例如 "Luraph v14.7"
-    mode: str = "devirt"           # devirt（完整反虚拟化） | trace（行为追踪）
+    mode: str = "devirt"           # devirt（反虚拟化输出） | trace（行为追踪）
     elapsed: float = 0.0
     returncode: int | None = None
     cancelled: bool = False
@@ -603,6 +602,7 @@ async def run_job(*, deobf_dir: Path, src: Path, workdir: Path, opt: Options,
                 notes.append(f"deob.py 检测：{plugin}"
                              + (f"（置信度 {conf}）" if conf else ""))
             elif looks_like_v14(head):
+                # 这是 bot wrapper 的无横幅回退顺序，不是上游的版本检测保证。
                 order = ["14.7", "14.9", "14.8"]
                 attempts = [Attempt("v14", v, f"Luraph v{v}") for v in order]
                 notes.append("没有版本横幅，按 v14 依次尝试 " + " → ".join("v" + v for v in order))
@@ -642,13 +642,9 @@ async def run_job(*, deobf_dir: Path, src: Path, workdir: Path, opt: Options,
                          "trace_only": attempt.trace})
         cmd = build_cmd(python, deobf_dir, attempt.kind, src, out_path, use)
         res.command = cmd
-        # v14：默认直接上「完整配方」（KEEP_ALL/PARTIAL/LOOP_ONCE）。它才是把
-        # 14.7 整份脚本走完的那条路（默认参数只出十几行行为追踪）；代价是慢。
-        extra_env = dict(DEEP_ENV) if (attempt.kind == "v14" and opt.complete_v14) else None
-        if extra_env:
-            res.stages.append("v14 完整配方已启用（最完整，耗时较长）")
+        # 不给上游引擎注入本仓库旧版的样本适配环境变量；使用上游默认行为。
         rc, timed_out, cancelled = await _run_once(
-            cmd, deobf_dir, log_path, on_line_wrap, left, cancel_event, extra_env=extra_env)
+            cmd, deobf_dir, log_path, on_line_wrap, left, cancel_event)
 
         res.returncode = rc
         if cancelled:
@@ -669,8 +665,7 @@ async def run_job(*, deobf_dir: Path, src: Path, workdir: Path, opt: Options,
                     cmd2[i + 1] = str(max(30, int(opt.harness_timeout) // 2))
             res.command = cmd2
             rc2, to2, cc2 = await _run_once(
-                cmd2, deobf_dir, log_path, on_line_wrap, left, cancel_event,
-                extra_env=extra_env)
+                cmd2, deobf_dir, log_path, on_line_wrap, left, cancel_event)
             res.returncode = rc2
             if cc2:
                 res.cancelled = True
@@ -698,9 +693,8 @@ async def run_job(*, deobf_dir: Path, src: Path, workdir: Path, opt: Options,
     final_engine = res.engine or (attempts[-1].label if attempts else "")
     res.engine = final_engine
 
-    # 版本标注：有横幅就按横幅；没有横幅的 v14 样本再看运行日志里的"进入布局"证据。
-    # （v14.7/14.8 是宿主直接调用 payload，#v14.9 是 VM 调度循环去调；实测三个引擎
-    #   对无横幅样本产出一致，所以这里只影响展示，不影响解出来的结果。）
+    # 版本标注：有横幅优先按横幅；无横幅时只用运行时布局线索，否则标为 v14.x。
+    # 这是展示信息，不代表已验证该版本引擎对当前样本完全兼容。
     if (res.engine or "").startswith("Luraph v14") and not any(
             n.startswith("文件头横幅") for n in notes):
         if V14_DISPATCH_LAYOUT.search("\n".join(all_lines)):
@@ -708,7 +702,7 @@ async def run_job(*, deobf_dir: Path, src: Path, workdir: Path, opt: Options,
             res.stages.append("无版本横幅：按运行时的 VM 调度布局判定为 v14.9")
         else:
             res.engine = "Luraph v14.x"
-            res.stages.append("无版本横幅：v14.7/v14.8/v14.9 引擎对该样本产出一致")
+            res.stages.append("无版本横幅：无法进一步区分 v14.x")
 
     if res.cancelled:
         res.note = "任务被取消"
@@ -724,8 +718,7 @@ async def run_job(*, deobf_dir: Path, src: Path, workdir: Path, opt: Options,
     trace_hints = ("refusing v14 static output", "trace-assisted", "behaviour trace",
                    "behavior trace", "compact trace", "no-devirt")
     warned_trace = any(h in w.lower() for w in res.warnings for h in trace_hints)
-    # 输出本身才算判据：日志里出现"回退到轨迹"的警告并不代表结果就是轨迹——
-    # 14.8 这类样本会在严格模式被拒后改跑部分反虚拟化，产出的是两千多行真实代码。
+    # 结合产物内容与警告判断；不能只凭回退日志，因为 CLI 还可能继续尝试部分反虚拟化。
     small_output = res.line_count <= 60 or res.size_bytes <= 8192
     if opt.trace_only or looks_like_trace(res.output) or (warned_trace and small_output):
         res.mode = "trace"
@@ -736,15 +729,12 @@ async def run_job(*, deobf_dir: Path, src: Path, workdir: Path, opt: Options,
         res.note = ("这次只拿到行为追踪（脚本真正执行到的分支），不是完整的反虚拟化——"
                     "原脚本里没跑到的代码不会出现。")
         if (res.engine or "").startswith("Luraph v14"):
-            res.note += ("想要更完整的静态结果，可在服务器设置环境变量 "
-                         "DEVIRT_V14_KEEP_ALL=1 DEVIRT_V14_PARTIAL=1 "
-                         "DEVIRT_V14_LOOP_ONCE=1 后重跑同一个文件。")
+            res.note += "可查看日志和深度捕获附件辅助分析；这些信息不保证构成完整源码。"
     if res.fallback_used:
         res.note = ((res.note + " ") if res.note else "") + "静态反虚拟化失败，已自动回退到行为追踪。"
 
-    # ---- 深度补充：v14 样本再给「逐条反汇编 + 参考清单」 --------------------
-    # 这两份清单是本次调研里最实在的改进：14.9 那种结果几乎是加密块的样本，
-    # 反汇编清单（631 条指令）和 460 条字符串常量比结果本身有用得多。
+    # ---- 深度补充：v14 样本尝试生成反汇编与参考清单 ----------------------
+    # 这是 bot wrapper 的 best-effort 附件生成，不修改上游引擎主输出，也不保证覆盖完整源码。
     no_deep = str(os.environ.get("DEOBF_NO_DEEP_CAPTURE", "")).strip().lower() in (
         "1", "true", "yes", "on")
     if no_deep:
@@ -762,7 +752,7 @@ async def run_job(*, deobf_dir: Path, src: Path, workdir: Path, opt: Options,
             except Exception as exc:                      # 绝不因为附加品失败影响主结果
                 deep = {"note": f"深度捕获异常：{exc}"}
             got: list[str] = []
-            if deep.get("lift"):                          # 真代码排最前面
+            if deep.get("lift"):                          # 候选片段附件排最前面
                 res.extras.append(deep["lift"])
                 ok = deep.get("lift_ok")
                 got.append("部分反编译" + ("（语法检查通过）" if ok else ""))
@@ -780,7 +770,7 @@ async def run_job(*, deobf_dir: Path, src: Path, workdir: Path, opt: Options,
                        len(stats.get("funcs") or []), stats.get("protos") or 0,
                        stats.get("bytecode_arrays") or 0))
                 res.note = ((res.note + " ") if res.note else "") + (
-                    "另外附了「%s」——反虚拟化没走到的地方，可以拿这些对照着看。"
+                    "另外附了「%s」供辅助分析；这些材料可能不完整，不保证语义正确或覆盖完整源码。"
                     % "」「".join(got))
             elif deep.get("note"):
                 res.stages.append("深度捕获：" + str(deep["note"]))
@@ -799,21 +789,9 @@ async def run_job(*, deobf_dir: Path, src: Path, workdir: Path, opt: Options,
 
 
 # --------------------------------------------------------------------------
-# v14 深度捕获：lifter 走不通时，至少给出「逐条反汇编 + 常量/API 清单」
-#
-# 上游 devirt.py 自带一个调试 CLI：
-#   python obfuscators/luraph_v14_8/devirt.py <src> <protos.json> --raw <root>
-# 它能把捕获到的 proto 逐条打印出来（寄存器级操作 + 跳转 + 断点原因）。14.9 这种
-# 反虚拟化基本失败、结果几乎是加密块的样本，这份清单比结果本身有用得多。
+# v14 深度捕获：bot wrapper 使用上游的捕获 / --raw / --lift 接口尝试生成辅助材料。
+# 这些产物是 best-effort 诊断信息，不是完整源码，也不保证对所有样本有效。
 # --------------------------------------------------------------------------
-
-#: 让 14.7 / 14.9 也尽力做出静态捕获（不给这三个变量时它们只出行为追踪）
-DEEP_ENV = {
-    "DEVIRT_V14_KEEP_ALL": "1",
-    "DEVIRT_V14_PARTIAL": "1",
-    "DEVIRT_V14_LOOP_ONCE": "1",
-}
-
 
 def find_protos_json(workdir: Path) -> Path | None:
     """找捕获阶段的 *.protos.json（上游在 --keep-work 时写在 .<名字>_work/ 里）。"""
@@ -880,8 +858,7 @@ def summarize_protos(protos_json: Path) -> dict:
                 take(pair[0])
                 take(pair[1])
 
-    # 实测：真正干活的 proto 编号都很小（14.7 root 1 → 877 行，14.8 root 2 →
-    # 1036 行，而 root_callee 猜到的 35 只有 423 行），所以候选按编号从小到大补。
+    # 编号较小的 proto 仅作为 bot wrapper 的启发式候选；它不是上游定义的 root，也不保证适用于所有样本。
     nums = sorted(int(k) for k in protos if str(k).isdigit()) if hasattr(protos, "__iter__") else []
     info["low_protos"] = nums[:8]
 
@@ -941,7 +918,7 @@ async def deep_capture(*, python: str, deobf_dir: Path, src: Path, workdir: Path
                        opt: Options, base_out: Path, version: str,
                        timeout: float = 480.0,
                        on_line: Callable[[str], None] | None = None) -> dict:
-    """v14 专用第二遍：完整配方跑一次静态捕获，再产出反汇编与参考清单。
+    """v14 专用第二遍：必要时用上游 CLI 默认参数补跑捕获，并尝试生成参考附件。
 
     返回 {"ran", "disasm", "refs", "stats", "note"}；任何一步失败只是少一个附件。
     """
@@ -959,13 +936,11 @@ async def deep_capture(*, python: str, deobf_dir: Path, src: Path, workdir: Path
             return result
         use = Options(**{**opt.__dict__, "version": version, "trace_only": False})
         cmd = build_cmd(python, deobf_dir, "v14", src, deep_out, use) + ["--keep-work"]
-        env = _child_env()
-        env.update(DEEP_ENV)
         result["ran"] = True
         proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
-                *cmd, cwd=str(deobf_dir), env=env,
+                *cmd, cwd=str(deobf_dir), env=_child_env(),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
                 **_popen_kwargs())
 
@@ -1007,9 +982,8 @@ async def deep_capture(*, python: str, deobf_dir: Path, src: Path, workdir: Path
         result["refs"] = refs
 
 
-    # ---- 反汇编：把候选根都试一遍，取最长的那份（挑错根只剩几百行脚手架）----
-    # 顺序很讲究：实测编号最小的 proto（1、2）才是真正干活的根，而上游给的
-    # root_callee 经常是脚手架，所以「头两个候选 + 小号 proto」都要试到。
+    # ---- 反汇编：尝试候选根，并取最长的输出作为辅助材料 --------------------
+    # 先用上游提供的 root hints，再把编号较小的 proto 作为 wrapper 启发式候选；这不是通用保证。
     st = result["stats"]
     hinted = [c for c in ([st.get("root")] + list(st.get("root_candidates") or []))
               if c is not None]
@@ -1036,9 +1010,8 @@ async def deep_capture(*, python: str, deobf_dir: Path, src: Path, workdir: Path
         disasm = out_dir / (base_out.stem + ".反汇编.txt")
         header = ("-- 逐条反汇编（寄存器级）：来自深度捕获，lifter 走不通的位置会标 !!\n"
                   f"-- 引擎 Luraph v{display_ver}；"
-                  f"root proto #{best_root}（共试了 {len(tries)} 个根，取最完整的一份）\n"
-                  "-- 说明：这是「每条 VM 指令做了什么」，不是完整源码；\n"
-                  "--       但它能看到结果文件里被跳过/加密的部分，请配合参考清单一起看。\n\n")
+                  f"root proto #{best_root}（共试了 {len(tries)} 个根，取输出最长的一份）\n"
+                  "-- 说明：这是寄存器级指令转储，不是源码；它可能不完整，仅供辅助分析。\n\n")
         try:
             disasm.write_text(header + best_text, encoding="utf-8")
             result["disasm"] = disasm
@@ -1046,9 +1019,7 @@ async def deep_capture(*, python: str, deobf_dir: Path, src: Path, workdir: Path
         except OSError:
             pass
 
-    # ---- 部分反编译：逐块 --lift，把没进主结果的真代码也捞出来 ----
-    # 实测：14.9 主结果只有 39 行追踪，但 --lift 2 能给出 337 行真 Luau（语法通过）；
-    # 14.8 的 --lift 1/2 各有 2100/2000 行，和主结果重合不到 2%。
+    # ---- 部分反编译：用上游 --lift 作为可选补充；输出仅供参考 ----------------
     try:
         main_text = base_out.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -1077,11 +1048,10 @@ async def deep_capture(*, python: str, deobf_dir: Path, src: Path, workdir: Path
             f"-- root proto #{root}　{mark[ok]}　（这一段可以单独阅读）\n"
             f"-- ============================================================\n{text}\n"
             for root, text, ok in checked)
-        head = ("-- 部分反编译（来自深度捕获）：主结果里被跳过/加密、但这里能还原成真代码的部分\n"
+        head = ("-- 部分反编译（bot wrapper 使用上游 --lift 尝试生成的候选片段）\n"
                 f"-- 引擎 Luraph v{display_ver}；共 {len(checked)} 段，"
                 f"{n_ok} 段单独通过语法检查\n"
-                "-- 说明：每段是一块独立代码，段与段之间可能不连贯（缺的那部分 VM 状态没解出来），\n"
-                "--       但里面的逻辑都是真的；需要完整源码请以主结果为准。\n\n")
+                "-- 说明：片段可能不完整或不可独立运行；语法检查不代表语义正确，也不保证覆盖完整源码。\n\n")
         lift_ok = (n_ok == len(checked)) or None if luau_ast is None else (n_ok == len(checked))
         lift = out_dir / (base_out.stem + ".部分反编译.lua")
         try:

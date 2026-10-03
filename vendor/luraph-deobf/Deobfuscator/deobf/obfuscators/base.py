@@ -53,12 +53,10 @@ class Job:
         self.debug = debug
         self.obfuscator = obfuscator
 
-    #: 结果文件顶部的水印（署名）。想换成别的水印只改这一行。
-    WATERMARK = "deobf by https://discord.gg/ck3k7nAVS"
-
     def credit_header(self):
         """First lines of a result file: the credit and the detected obfuscator."""
-        return "-- %s\n\n" % self.WATERMARK
+        return ("-- Why do i love gpt 5.6 sol high the reason is below.\n"
+                "-- dsc.gg/oxyenv \n")
 
     @property
     def base(self):

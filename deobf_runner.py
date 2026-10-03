@@ -130,7 +130,7 @@ class Result:
     stages: list[str] = field(default_factory=list)
     command: list[str] = field(default_factory=list)
     note: str = ""                 # 需要展示给用户的说明（例如"只拿到行为追踪"）
-    extras: list[Path] = field(default_factory=list)   # 额外附件（反汇编清单 / 参考清单）
+    extras: list[Path] = field(default_factory=list)   # 内部诊断材料；Discord 仅回传主 Lua 结果
 
     @property
     def size_bytes(self) -> int:
@@ -710,7 +710,7 @@ async def run_job(*, deobf_dir: Path, src: Path, workdir: Path, opt: Options,
     if res.timed_out:
         return res
     if not res.output:
-        res.note = res.note or "没有产出结果文件，日志见附件。"
+        res.note = res.note or "没有产出结果文件，请联系管理员查看服务器任务日志。"
         return res
 
     res.ok = True
@@ -729,7 +729,7 @@ async def run_job(*, deobf_dir: Path, src: Path, workdir: Path, opt: Options,
         res.note = ("这次只拿到行为追踪（脚本真正执行到的分支），不是完整的反虚拟化——"
                     "原脚本里没跑到的代码不会出现。")
         if (res.engine or "").startswith("Luraph v14"):
-            res.note += "可查看日志和深度捕获附件辅助分析；这些信息不保证构成完整源码。"
+            res.note += "管理员可查看服务器日志和内部深度诊断材料辅助分析；这些信息不保证构成完整源码。"
     if res.fallback_used:
         res.note = ((res.note + " ") if res.note else "") + "静态反虚拟化失败，已自动回退到行为追踪。"
 
@@ -770,8 +770,8 @@ async def run_job(*, deobf_dir: Path, src: Path, workdir: Path, opt: Options,
                        len(stats.get("funcs") or []), stats.get("protos") or 0,
                        stats.get("bytecode_arrays") or 0))
                 res.note = ((res.note + " ") if res.note else "") + (
-                    "另外附了「%s」供辅助分析；这些材料可能不完整，不保证语义正确或覆盖完整源码。"
-                    % "」「".join(got))
+                    "服务器工作目录中生成了内部诊断材料（%s）；Discord 仅回传主 Lua 结果。"
+                    "这些材料可能不完整，不保证语义正确或覆盖完整源码。" % "、".join(got))
             elif deep.get("note"):
                 res.stages.append("深度捕获：" + str(deep["note"]))
 

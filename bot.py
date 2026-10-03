@@ -6,7 +6,7 @@ Luraph 解混淆 Discord 机器人
 
 用法（在频道里）：
 
-    .deobf  + 上传被保护的脚本   -> 自动识别 Luraph 版本，解混淆并把结果发回来
+    .deobf  + 上传被保护的脚本   -> 自动识别版本并解混淆；只回传主 Lua 结果文件
     .help                        -> 指令列表
     斜杠命令：/deobf、/help、/stats
 
@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import io
 import json
 import logging
 import os
@@ -106,7 +105,7 @@ DEFAULTS: dict = {
     "queue_size": 20,
     "user_cooldown_seconds": 60,
     "max_input_mb": 25,
-    "max_upload_mb": 8,             # Discord 附件上限，超了就打包 zip
+    "max_upload_mb": 8,             # 主 Lua 结果上限，超了只打包该脚本
     "harness_timeout": 150,         # 传给解混淆器的单次运行超时（秒）
     "time_budget": 30,              # 被追踪脚本的时间预算（秒）
     "devirt_rounds": 200,
@@ -542,34 +541,34 @@ def progress_embed(bot: "DeobfBot", job: Job) -> discord.Embed:
     return e
 
 
+def primary_lua_result(outdir: Path) -> Path | None:
+    """Select only a task's main Lua result, excluding partial/debug artifacts."""
+    if not outdir.is_dir():
+        return None
+    for pattern in ("*.deob.lua", "*.trace.luau"):
+        matches = sorted(p for p in outdir.glob(pattern) if p.is_file())
+        if matches:
+            return matches[0]
+    return None
+
+
 def result_embed(bot: "DeobfBot", job: Job, res: Result) -> discord.Embed:
     if not res.ok:
         e = discord.Embed(
             title=f"❌ 任务 {job.id} 失败",
-            description=res.note or "解混淆器没有产出结果，日志见附件。",
+            description=res.note or "解混淆器没有产出可发送的 Lua 脚本。",
             colour=0xED4245,
         )
     else:
-        mode = {"devirt": "✅ 完整反虚拟化", "trace": "🟡 行为追踪（只含跑到的分支）"}
+        description = None
+        if res.mode == "trace":
+            description = "本次只恢复了运行时实际执行到的路径，脚本可能不完整。"
         e = discord.Embed(
             title=f"✅ 任务 {job.id} 完成",
-            description=res.note or None,
+            description=description,
             colour=0x57F287,
         )
-        e.add_field(name="引擎", value=res.engine or "-", inline=True)
-        e.add_field(name="输出类型", value=mode.get(res.mode, res.mode), inline=True)
-        e.add_field(name="用时", value=f"{res.elapsed:.1f} 秒", inline=True)
-        e.add_field(name="结果大小", value=f"{res.size_bytes / 1024:.1f} KB / "
-                                           f"{res.line_count} 行", inline=True)
-        e.add_field(name="源文件", value=job.source_name, inline=True)
-    if res.warnings:
-        shown = res.warnings[:4]
-        e.add_field(name="警告", value="\n".join(f"• {w[:150]}" for w in shown)[:1000],
-                    inline=False)
-    if res.stages:
-        e.add_field(name="耗时阶段", value="\n".join(f"• {s[:120]}" for s in res.stages[-4:])[:1000],
-                    inline=False)
-    e.set_footer(text=f"{job.user_name} · 输出由自动化解混淆工具生成，可能不完整")
+    e.set_footer(text=f"{job.user_name} · 仅附上主 Lua 结果文件")
     return e
 
 
@@ -773,81 +772,35 @@ class DeobfBot(discord.Client):
         stem = re.sub(r"[^\w\-.]+", "_", stem)[:60]
         return f"{stem}.{'trace.luau' if res.mode == 'trace' else 'deob.lua'}"
 
-    def _extra_name(self, job: Job, res: Result, extra: Path) -> str:
-        """深度清单也用和主结果一样的名字，同一个任务的文件排在一起不会乱。"""
-        main = self._out_name(job, res)
-        tail = extra.name.split("input.deob.", 1)[-1]
-        return f"{Path(main).stem}.{tail}"
-
-    def _maybe_zip(self, path: Path, extra: list[Path]) -> Path:
+    def _maybe_zip(self, path: Path) -> Path:
+        """大结果只能压缩主 Lua 文件；日志和诊断材料绝不打进回传包。"""
         zip_path = path.with_suffix(path.suffix + ".zip")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
             z.write(path, path.name)
-            for p in extra:
-                if p.is_file():
-                    z.write(p, p.name)
         return zip_path
 
     async def deliver(self, job: Job, res: Result) -> None:
         view = self.resend_view
         embed = result_embed(self, job, res)
-        log_file = job.workdir / "log.txt"
         limit = float(self.cfg["max_upload_mb"]) * 1024 * 1024
         files: list[discord.File] = []
 
         if res.ok and res.output and res.output.is_file():
             payload = res.output
-            # 超过上传上限、或用户要了 debug（中间文件），打包成 zip
-            if payload.stat().st_size > limit or job.opt.debug:
-                extra = [p for p in res.output.parent.iterdir()
-                         if p.is_file() and p != res.output] if job.opt.debug else []
-                if log_file.is_file():
-                    extra.append(log_file)
-                payload = self._maybe_zip(res.output, extra)
             if payload.stat().st_size > limit:
-                preview = res.output.read_bytes()[:400_000]
-                files.append(discord.File(io.BytesIO(preview),
-                                          filename=self._out_name(job, res) + ".preview.txt"))
-                embed.add_field(
-                    name="注意",
-                    value=f"结果 {res.output.stat().st_size / 1048576:.1f} MB 超过上传上限，"
-                          f"这里只发了前 400 KB 预览；完整文件在服务器上：\n`{res.output}`",
-                    inline=False)
+                payload = self._maybe_zip(payload)
+            if payload.stat().st_size <= limit:
+                filename = self._out_name(job, res)
+                if payload != res.output:
+                    filename += ".zip"
+                files.append(discord.File(payload, filename=filename))
             else:
-                files.append(discord.File(payload, filename=payload.name))
-
-            # ---- 深度清单：参考清单 / 逐条反汇编，跟着结果一起发 ----
-            sent_extra: list[str] = []
-            for extra in (res.extras or []):
-                if len(files) >= 5:      # 主结果 + 4 个附件（Discord 上限 10）
-                    break
-                try:
-                    if not extra.is_file():
-                        continue
-                    fname = self._extra_name(job, res, extra)
-                    if extra.stat().st_size > limit:
-                        head = extra.read_text(encoding="utf-8", errors="replace")[:200_000]
-                        files.append(discord.File(
-                            io.BytesIO(head.encode("utf-8")),
-                            filename=Path(fname).stem + ".preview.txt"))
-                    else:
-                        files.append(discord.File(extra, filename=fname))
-                    sent_extra.append(fname)
-                except (OSError, discord.HTTPException):
-                    continue
-            if sent_extra:
-                embed.add_field(
-                    name="另附",
-                    value="\n".join(f"• `{n}`" for n in sent_extra)
-                          + "\n反虚拟化没走到的地方，可以拿这两份对照着看。",
-                    inline=False)
-        else:
-            if res.output and not res.output.is_file():
-                embed.add_field(name="注意", value="没有找到结果文件（可能被 engine 删掉了）", inline=False)
-            if log_file.is_file():
-                tail = log_file.read_text(encoding="utf-8", errors="replace")[-60_000:]
-                files.append(discord.File(io.BytesIO(tail.encode("utf-8")),
-                                          filename=f"job-{job.id}.log.txt"))
+                embed.description = (
+                    "Lua 结果超过配置的回传上限；未发送截断预览或诊断文件。"
+                    f"完整脚本仍保存在服务器：`{res.output}`"
+                )
+        elif res.ok:
+            embed.description = "任务没有找到可发送的 Lua 结果文件。"
 
         try:
             if job.status_msg:
@@ -898,14 +851,25 @@ class DeobfBot(discord.Client):
             return
         workdir = self.work_root / f"job-{job_id}"
         outdir = workdir / "out"
-        files = sorted(outdir.glob("*")) if outdir.is_dir() else []
-        if not files:
+        result_file = primary_lua_result(outdir)
+        if result_file is None:
             await interaction.response.send_message(
-                f"任务 {job_id} 的结果文件已经不在服务器上了。", ephemeral=True)
+                f"任务 {job_id} 的 Lua 结果文件已经不在服务器上了。", ephemeral=True)
             return
+
         await interaction.response.defer()
-        payload = [discord.File(p, filename=p.name) for p in files[:5]]
-        await interaction.followup.send(files=payload)
+        payload = result_file
+        limit = float(self.cfg["max_upload_mb"]) * 1024 * 1024
+        if payload.stat().st_size > limit:
+            payload = self._maybe_zip(payload)
+        if payload.stat().st_size > limit:
+            await interaction.followup.send(
+                f"任务 {job_id} 的 Lua 结果超过配置的回传上限；未发送预览或诊断文件。",
+                ephemeral=True,
+            )
+            return
+        filename = result_file.name + ".zip" if payload != result_file else result_file.name
+        await interaction.followup.send(file=discord.File(payload, filename=filename))
 
     # ---------------- 消息指令 ----------------
     async def on_message(self, message: discord.Message) -> None:
